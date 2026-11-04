@@ -15,12 +15,15 @@
 # fed prebuilt artifacts: FRAMEWORK_JARS=... for the dex (see tools/build-daemon.sh) and files
 # already present in build/ for the natives (tools/make-aosp-deps.sh produces both).
 #
-# The wired switch additionally needs a lockdown identity (a matching cert/key PEM
-# pair).  This repository deliberately ships no key material: put your own pair in
+# The wired switch needs a lockdown TLS identity (a matching cert/key PEM pair) at
+# /data/local/tmp/lockdown-{cert,key}.pem.  This repository deliberately ships no key
+# material, and it does not have to: native/ffs-usbmux/okcar-ffs-usbmux.c carries a
+# --gen-identity subcommand (static BoringSSL) that writes a self-signed RSA-2048 /
+# CN=iPhone pair, and module/system/bin/okcar-carkit calls it whenever the pair is
+# missing (identity_ensure).  So a clean install comes up on wired without any host
+# step.  If you would rather pin a specific identity, put it in
 # lockdown/lockdown-cert.pem + lockdown/lockdown-key.pem (gitignored) and it is packed
-# into payload/.  docs/en/architecture.md / docs/zh/architecture.md explain how to
-# generate a matching pair.  Wired mode stays off until the pair is readable at
-# /data/local/tmp/lockdown-{cert,key}.pem, so a missing pair degrades gracefully.
+# into payload/ and installed on start instead of being generated.
 set -e
 cd "$(dirname "$0")"
 REPO=$(cd .. && pwd)
@@ -60,7 +63,7 @@ for _f in lockdown-cert.pem lockdown-key.pem; do
   if [ -f "$REPO/lockdown/$_f" ]; then
     cp "$REPO/lockdown/$_f" "$STAGE/payload/$_f"
   else
-    echo "note: lockdown/$_f missing -- wired mode cannot complete EnableSessionSSL; see docs" >&2
+    echo "note: lockdown/$_f absent -- the module will generate a self-signed identity on first wired start" >&2
   fi
 done
 

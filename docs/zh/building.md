@@ -53,12 +53,18 @@ zip 是你唯一要安装的东西；另外三个是打包器复制到位的中�
 
 下文路径都相对这个根；脚本会 `cd` 到自身目录并自行推导根，所以从任何工作目录都能跑。
 
-### 2.2 第 2 步——生成 lockdown 身份（可选；有线模式必需）
+### 2.2 第 2 步——lockdown 身份（可选；模块会自己生成）
 
-有线 CarPlay 必须向车机的 lockdown 握手出示证书，所以支持有线的构建需要一份你自己生成的密钥对：
-仓库不附带任何密钥材料，因为一个私钥在每个 fork 里都公开的 root 模块，在每个安装里都会一模一样。
-原理与失败模式见 `docs/zh/crypto.md`；命令在此重复以保持本页自足，它们只写进 gitignore 的
-`lockdown/`（在仓库根执行）。
+有线 CarPlay 必须向车机的 lockdown 握手出示证书。仓库不附带任何密钥材料，因为一个私钥在每个 fork 里都公开的
+root 模块，在每个安装里都会一模一样——所以密钥对改为首次使用时现场生成：`/data/local/tmp/lockdown-{cert,key}.pem`
+不存在时，`okcar-carkit` 调用 `okcar-ffs-usbmux --gen-identity`，由原生用它已经静态链接的 BoringSSL 写出自签名
+RSA-2048 证书（`CN=iPhone`、v3、sha256WithRSA、十年）。因此全新安装不需要任何宿主机步骤，恢复出厂设置清空
+`/data/local/tmp` 也只会让下一次有线启动重新生成一对。日后要更换，用 WebUI 有线页面的*重新生成证书*按钮，或
+`okcar-port-ctl identity regen`；只跑 `okcar-port-ctl identity` 会报告当前装的是什么。原理与失败模式见
+`docs/zh/crypto.md`。
+
+如果你希望身份由自己指定——例如给一批设备分发同一对，或希望它从第一次开机就在 `payload/` 里——就在宿主机上
+生成。以下命令只写进 gitignore 的 `lockdown/`（在仓库根执行）：
 
     mkdir -p lockdown
     openssl req -x509 -newkey rsa:2048 -keyout lockdown/lockdown-key.pem \
@@ -74,18 +80,15 @@ zip 是你唯一要安装的东西；另外三个是打包器复制到位的中�
 
 对外宣告的公钥**不编译进二进制**。`okcar-ffs-usbmux` 回答 `GetValue DevicePublicKey` 时，从它自己安装的证书
 （`/data/local/tmp/lockdown-cert.pem`）里提取 PKCS#1 公钥并原样返回，所以宣告的密钥与同一二进制在 TLS 层
-出示的证书不可能不一致——也就是本页过去警告的那种经典有线故障。生成完上面的密钥对，这一步就结束了。
+出示的证书不可能不一致——也就是本页过去警告的那种经典有线故障。现场生成的一对和你自己提供的一对都如此。
 
 如果你更愿意保留编译期常量：`native/ffs-usbmux/okcar-ffs-usbmux.c` 里的 `DEVICE_PUBKEY_PKCS1_PEM_B64` 非空时
 仍优先生效，且形式必须是 PKCS#1（普通 `-pubout` 产出 SubjectPublicKeyInfo，车机会拒绝）：
 
     openssl rsa -in lockdown/lockdown-key.pem -RSAPublicKey_out | base64 -w0   # RSA-2048 约 568 个字符
 
-打包器把 `lockdown/lockdown-{cert,key}.pem` 复制进 `payload/`，因为 `/data/local/tmp` 会被恢复出厂设置
-清空，密钥对必须随模块回来。只做镜像的构建完全不需要这些：没有密钥对时打包器打印
-`note: lockdown/<file> missing -- wired mode cannot complete EnableSessionSSL` 并继续；若主机仍来索取，
-有线原生会记录 `no DevicePublicKey available`。
-
+`lockdown/lockdown-{cert,key}.pem` 存在时打包器会把它们复制进 `payload/`，不存在时静默跳过，因为模块能自己
+生成；它打印的 `note: lockdown/<file> absent` 只是提示，不是缺陷。把密钥对放进 `payload/` 只是省掉首次生成。
 ### 2.3 第 3 步——构建原生助手
 
     TREE=/path/to/aosp native/uinputd/build.sh      # -> build/okcar-uinputd
@@ -165,7 +168,7 @@ graphics、media framework jar。移植要用到 `android.jar` 不暴露的平�
 | `note: build/okcar-uinputd missing -- the matching feature reports its daemon as unavailable at runtime` | 镜像能工作，触摸到不了车机屏幕；`REQUIRE_ARTIFACTS=1` 时改为直接中止 |
 | `note: build/okcar-ffs-usbmux missing -- ...`（同样的措辞） | 有线开关绑不了 gadget |
 | `note: build/okcar-link.dex missing -- ...`（同样的措辞） | 模块能装，但守护进程永远起不来 |
-| `note: lockdown/<file> missing -- wired mode cannot complete EnableSessionSSL` | 有线模式在 TLS 握手处失败，而不是在启动处失败 |
+| `note: lockdown/<file> absent -- the module will generate a self-signed identity on first wired start` | 没问题：`payload/` 里没有固定的密钥对，首次有线启动会现场生成一对（§2.2） |
 
 然后：把分发变体标记 `lite` 写进 `webroot/variant`；设置显式权限，因为工作区常以 `0600` 存放一切，而
 `0600` 的助手不可执行、`0600` 的 `.idc` 会把注入的触摸屏误判成普通指针——`post-fs-data.sh`、
@@ -246,15 +249,17 @@ okcar-port-lite,okcarlink}` 以及 `/data/adb/modules_update` 下的相同路径
 `main()`，可用普通 `javac`/`java` 在主机 JVM 上运行——不需要设备，也不需要 AOSP 树。可选的 Wi-Fi 自检在
 `okcar-wifi-selftest.conf` 存在时读取它（`ssid=`/`passphrase=`）；不要把那些值提交进文件。
 
-有线模式只在 lockdown 密钥对**存在之后**：
+有线模式：
 
     okcar-port-ctl switch wired on        # 刻意重新配置 USB 并绑定 Apple gadget
 
-`okcar-carkit` 把密钥对安装到 `/data/local/tmp/lockdown-cert.pem`（`0644`）与
-`/data/local/tmp/lockdown-key.pem`（`0600`），已经一致时跳过复制；原生服务端监听 lockdownd 端口 `62078`，
-并通过抽象套接字 `okcar-carkit` 与 Java 侧通信。新安装的密钥对只有在有线开关被循环一次后才生效，因为每个
-进程只构建一次 TLS 上下文；不一致会以 `tls: cert/key do not match` 报告一次。没有密钥对时握手在
-`EnableSessionSSL` 处以 `NO_CERTIFICATE_SET` 失败——完整行集见 `docs/zh/crypto.md` §6。
+`okcar-carkit` 先在模块自带了固定密钥对时把 `payload/lockdown-{cert,key}.pem` 复制到
+`/data/local/tmp`；否则（或只剩一半时）运行 `okcar-ffs-usbmux --gen-identity`，写出
+`/data/local/tmp/lockdown-cert.pem`（`0644`）与 `/data/local/tmp/lockdown-key.pem`（`0600`），并记录
+`TLS: 已现场生成自签名身份（CN=iPhone）`。原生服务端监听 lockdownd 端口 `62078`，并通过抽象套接字
+`okcar-carkit` 与 Java 侧通信。新安装的密钥对只有在有线开关被循环一次后才生效，因为每个进程只构建一次
+TLS 上下文；不一致会以 `tls: cert/key do not match` 报告一次。`okcar-port-ctl identity` 报告当前装的是什么，
+`identity regen` 则换掉它——完整行集见 `docs/zh/crypto.md` §6。
 
 ### 2.8 第 8 步——在托管 runner 上做 CI
 
@@ -304,9 +309,9 @@ okcar-port-lite,okcarlink}` 以及 `/data/adb/modules_update` 下的相同路径
 | `okcar-port-check` 以 1 退出并报 "not found / not executable" | zip 里缺 `okcar-linkd` 或 `okcar-port-ctl`，或模块目录又被改名 | 从完整的 `module/` 暂存重新构建；消息会指出缺的是哪个文件 |
 | 有线开关报告守护进程缺失；UDC 始终不绑定 | `build/okcar-ffs-usbmux` 被跳过 | 带 `TREE` 重新构建并重刷（第 2.3 节） |
 | 车机能镜像但车机屏幕没有触摸 | `build/okcar-uinputd` 被跳过 | 同上 |
-| `EnableSessionSSL` 处 `NO_CERTIFICATE_SET`——"no certificate set" | 密钥对从未安装、不可读或为空，出厂重置后也会如此，因为 `/data/local/tmp` 被清空 | 循环一次有线开关，让 `okcar-carkit` 重新安装 `/data/local/tmp/lockdown-{cert,key}.pem`；完整行集与不一致情形见 `docs/zh/crypto.md` §6 |
-| 有线日志里 `tls: cert/key do not match` | `lockdown/lockdown-cert.pem` 与 `lockdown/lockdown-key.pem` 不是同一对 | 重新生成一对匹配的密钥对（第 2.2 节）并重装 |
-| 新安装的密钥对不生效 | 每个进程只构建一次 TLS 上下文 | 循环有线开关，或重启模块 |
+| `EnableSessionSSL` 处 `NO_CERTIFICATE_SET`——"no certificate set" | 密钥对缺失、不可读或为空——恢复出厂设置会清空 `/data/local/tmp`，而生成只在有线启动时跑 | 循环一次有线开关让 `okcar-carkit` 生成密钥对，或跑 `okcar-port-ctl identity regen`；完整行集与不一致情形见 `docs/zh/crypto.md` §6 |
+| 有线日志里 `tls: cert/key do not match` | 已安装的证书与密钥不是同一对（`payload/` 里固定的密钥对只覆盖了其中一半） | `okcar-port-ctl identity regen`，它会写出匹配的一对（第 2.2 节） |
+| 新安装的密钥对不生效 | 每个进程只构建一次 TLS 上下文 | 循环有线开关，或重启模块——有线正在跑时 `okcar-port-ctl identity regen` 会替你做这件事 |
 | `LEAK: <file>` ... `aborted`，退出 1，未产出 zip | 某个暂存文件命中三组模式之一 | 输出会指出文件与最多五个匹配字面量；删掉该内容后重跑 |
 | 构建"成功"，但 zip 里是上周的二进制 | 被跳过的构建被 `build/` 里遗留的旧产物悄悄满足 | `rm -rf build/` 后重建（第 2.5 节） |
 | `REQUIRE_ARTIFACTS=1: refusing to package an incomplete module`，退出 1 | 三个产物缺了一个，且开了 CI 式严格模式 | 带 `TREE` 补建缺的那件，或取依赖包（第 2.8 节） |
@@ -337,8 +342,8 @@ com.okcar.link.daemon.LinkDaemon`，此前先填好 `app_process` 期望的 `AND
 
 *  对全部五个脚本做了 `bash -n`（仅语法检查）：`tools/build-daemon.sh`、`tools/package-module.sh`、
    `tools/make-aosp-deps.sh` 与两个原生构建脚本。
-*  跑过真实构建：`TREE=... bash tools/package-module.sh` 产出单个 804,120 字节的 `build/okcar-link.dex`、
-   `build/okcar-uinputd`（1,964,472 B）与 `build/okcar-ffs-usbmux`（9,397,744 B）——两者都被 `file` 确认为
+*  跑过真实构建：`TREE=... bash tools/package-module.sh` 产出单个 805,580 字节的 `build/okcar-link.dex`、
+   `build/okcar-uinputd`（1,964,472 B）与 `build/okcar-ffs-usbmux`（9,416,576 B，含身份生成器）——两者都被 `file` 确认为
    `ELF 64-bit LSB executable, ARM aarch64, statically linked, for Android 33`——以及 36 个文件的
    `build/okcarlink-1.0.0.zip`。
 *  在没有 AOSP 检出的情况下本地跑过 CI 路径：`FRAMEWORK_JARS=<包>/framework-jars ANDROID_JAR=...
@@ -352,10 +357,17 @@ com.okcar.link.daemon.LinkDaemon`，此前先填好 `app_process` 期望的 `AND
    （记录在 `/data/local/tmp/okcar-linkd.status`），有线助手绑定了 `/dev/usb-ffs/okcar/ep0`，dex 与两个原生的
    设备侧 SHA-256 与主机构建逐字节一致。
 *  发布准备期间，泄漏门禁及其 `LEAK: <file>` 失败路径在暂存树上被实际触发过。
+*  自生成身份在同一台设备上实测过：删掉 `/data/local/tmp/lockdown-*.pem` 后一次有线启动记录了
+   `TLS: 已现场生成自签名身份（CN=iPhone）`，写出 969 字节的 `lockdown-cert.pem`（`0644`）与 1,704 字节的
+   `lockdown-key.pem`（`0600`）；在宿主机上用 `openssl x509` 读回为 `CN=iPhone`、自签名、RSA-2048、v3、
+   sha256WithRSA、十年。`okcar-port-ctl identity` 报告大小，`identity regen` 换掉这一对。
+*  在同一台设备上，用现场生成的密钥对、不做任何宿主机步骤，有线 CarPlay 完整跑通：`carkit: wired control
+   channel accepted` → `iAP2 link up` → `announced CarPlay availability 0x4300` → `accessory asked to start the
+   CarPlay session: WIRED address=fe80::2:7000` → `fe80::2%usb0 recovered after in-dial route re-assert` →
+   `pair-setup done` → HEVC 1080x2400@60 视频与 opus 音频持续输出（连续十二次统计为 `49.4`–`50.2` fps，
+   `droppedByFps=0`、`droppedByBacklog=0`，音频 `50.0 packets/s`、目标 `50/s`）。对端是车机模拟器，不是量产车机。
 
-未验证、因而仍**未经测试**的：与真实车机之间的完整 lockdown 握手。`DevicePublicKey` 回复现在在运行期从已安装
-证书中提取；这条代码路径已编译并随包发布，但尚未观察到它完成一次真车配对，旧的编译期形式同样没有。第 2.7 节与
-`docs/zh/crypto.md` 中其余有线模式陈述来自协议实现与录制会话，而非新的实测。
+未验证、因而仍**未经测试**的：有线路径与量产车机之间的实际表现——上面那次的对端是车机模拟器。已报告的成功应该可复现，但这里没有任何一项是对着出厂车机测的；无线配对的自检仍然读的是录制向量，而不是真机。
 
 ## 6. 依据来源
 

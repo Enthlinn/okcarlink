@@ -67,16 +67,17 @@ mismatch risk back: prefer leaving it empty.
 - The module runs as root on the head unit. A private key committed to the repository would be
   public in every fork and identical in every install — anyone could build a module presenting the
   same device identity.
-- `tools/package-module.sh` therefore takes the pair from the builder, never from the tree: it
-  copies `lockdown/lockdown-cert.pem` and `lockdown/lockdown-key.pem` (gitignored, builder
-  supplied) into the staged `payload/` directory, and prints a note and continues when they are
-  absent — wired mode simply cannot complete `EnableSessionSSL`.
+- `tools/package-module.sh` therefore never takes a pair from the tree: it copies
+  `lockdown/lockdown-cert.pem` and `lockdown/lockdown-key.pem` (gitignored, builder supplied) into
+  the staged `payload/` directory when they exist and prints a note when they do not. Wired mode
+  does not need them: the module creates its own pair on the first wired start (§4.3).
 - The private-key leak gate that scans every staged file exempts exactly these two files: every
   install must present a real pair, so their presence is intentional while their content is not
   public.
-- The module **does** ship a pair in the payload, because `/data/local/tmp` is wiped by a factory
-  reset and a head unit with a wiped `/data/local/tmp` cannot run wired mode at all. Shipping it
-  in `payload/` makes reinstall (or the helper's own install step) a one-command recovery.
+- Because `/data/local/tmp` is wiped by a factory reset, the identity has to be recreatable on the
+  unit itself. `okcar-ffs-usbmux --gen-identity` does that with the BoringSSL it already links:
+  RSA-2048, self-signed, `CN=iPhone`, v3, sha256WithRSA, ten years (§4.3). A pair placed in
+  `payload/` is optional and only pins a chosen identity.
 
 ## 4. Where the pair is read from
 
@@ -84,15 +85,18 @@ mismatch risk back: prefer leaving it empty.
 | --- | --- |
 | On device (certificate) | `/data/local/tmp/lockdown-cert.pem`, mode `0644` — `LOCKDOWN_CERT`, `native/ffs-usbmux/okcar-ffs-usbmux.c:100` |
 | On device (private key) | `/data/local/tmp/lockdown-key.pem`, mode `0600` — `LOCKDOWN_KEY`, `native/ffs-usbmux/okcar-ffs-usbmux.c:101` |
-| Source in the module zip | `payload/lockdown-cert.pem`, `payload/lockdown-key.pem` |
+| Source in the module zip | `payload/lockdown-cert.pem`, `payload/lockdown-key.pem` (optional — pins a chosen pair) |
+| Generated on device | `okcar-ffs-usbmux --gen-identity`, run by `okcar-carkit` when the pair is missing |
 | Builder input | `lockdown/lockdown-cert.pem`, `lockdown/lockdown-key.pem` (repository root, gitignored) |
 
-`install_lockdown_identity()` in `module/system/bin/okcar-carkit` does the copy
-(`module/system/bin/okcar-carkit:771`, called from the `start` verb at `:1281`). It preserves the
-two modes above, skips the copy when the destination is already identical (`cmp`), and says
-plainly at start time that wired will fail at `EnableSessionSSL` when the pair is missing. It
+`install_lockdown_identity()` in `module/system/bin/okcar-carkit` (`:771`, called from the
+`start` verb at `:1281`) resolves the identity from three sources in order: `payload/lockdown-*.pem`
+when the module ships a pinned pair, then whatever is already at `/data/local/tmp`, then
+`identity_ensure()` — which runs `okcar-ffs-usbmux --gen-identity` and logs
+`TLS: 已现场生成自签名身份（CN=iPhone）`. The two modes above are preserved on every path, and it
 does not cross-check the pair against the advertised constant — a mismatch is only visible in the
-handshake.
+handshake. `okcar-port-ctl identity` prints what is installed; `okcar-port-ctl identity regen`
+forces a new pair.
 
 ### 4.1 Caveat: the SSL context is built once per process
 
@@ -108,15 +112,28 @@ moment and never re-read:
 
 ### 4.2 Caveat: a factory reset erases the pair
 
-`/data/local/tmp` is wiped by a factory reset. The failure afterwards has no hint that a file is
-missing: usbmux still enumerates, the TLS server still starts, and then every handshake dies at
-`EnableSessionSSL` (this is a recorded field incident, not a hypothetical). Recovery is to
-reinstall the module or copy the pair from its `payload/` directory, then cycle the wired switch.
-This is the whole reason the module ships the pair.
+`/data/local/tmp` is wiped by a factory reset. Without generation the failure afterwards has no
+hint that a file is missing: usbmux still enumerates, the TLS server still starts, and then every
+handshake dies at `EnableSessionSSL` (this is a recorded field incident, not a hypothetical). With
+`identity_ensure()` in the start path that incident no longer reaches the host: the next wired
+start generates a pair first. If a device still shows it, the wired start ran an old binary or the
+generator failed (the log says `TLS: 生成证书失败`); `okcar-port-ctl identity regen` is the
+one-command recovery.
 
-## 5. Generate your own pair
+### 4.3 Caveat: a generated identity is a new device identity
 
-All commands run from the repository root and write only into the gitignored `lockdown/` directory
+Nothing in this protocol is pinned to one public key, and the head unit re-learns it from
+`GetValue DevicePublicKey` on every pairing, so a generated pair works like a shipped one. Two
+consequences are worth knowing: two phones that both generated their own pair are distinguishable
+to the host, and replacing a pair while a wired link is live needs the link rebuilt — §4.1 applies,
+and `okcar-port-ctl identity regen` does it automatically when `okcar-carkit.state` is `started`.
+
+## 5. Generate your own pair on the host (optional)
+
+You do not have to do any of this: `okcar-ffs-usbmux --gen-identity` builds an equivalent pair on the
+unit (§4.3), and that is what a clean install uses. Do it here only when you want a chosen identity —
+the same pair across a fleet, or a pair inside `payload/` before the first boot. All commands run
+from the repository root and write only into the gitignored `lockdown/` directory
 (`tools/package-module.sh` picks it up from there). Everything below is plain `openssl`; nothing
 from this repository is required to make the identity.
 
@@ -195,25 +212,27 @@ tools/package-module.sh
 ```
 
 It runs `native/ffs-usbmux/build.sh` (the runtime derivation, and any constant you pinned, live in
-the resulting `build/okcar-ffs-usbmux`), the dex build, stages `module/`, copies the `lockdown/` pair into `stage/payload/`, stamps the
-WebUI variant, runs the leak gate, and writes the release zip. The native build needs the AOSP tree
+the resulting `build/okcar-ffs-usbmux`), the dex build, stages `module/`, copies the `lockdown/` pair
+into `stage/payload/` when one is present (`note: lockdown/<file> absent` otherwise — expected, not a
+defect), stamps the WebUI variant, runs the leak gate, and writes the release zip. The native build needs the AOSP tree
 (see `docs/en/architecture.md`) because it links static BoringSSL and static bionic from the tree.
 
-**8. Check the shipped artifact.**
+**8. Check the shipped artifact (only if you pinned a pair).**
 
-After packaging, confirm the pair inside the staged payload is the one you built: repeat the two
-digest comparisons from steps 2–3 against `stage/payload/lockdown-cert.pem` and
+When a pair went into `lockdown/`, confirm the copy in the staged payload is the one you built:
+repeat the two digest comparisons from steps 2–3 against `stage/payload/lockdown-cert.pem` and
 `lockdown/lockdown-key.pem`. If you pinned a constant in step 6, compare it with that same key — a
 pinned constant is the only way the advertised key and the certificate can still disagree, and the
-failure would only show up in a car.
+failure would only show up in a car. A build with no `lockdown/` directory ships no pair at all and
+needs none of this; the device makes its own on first wired start.
 
 ## 6. Troubleshooting
 
 | Symptom | Cause | Fix |
 | --- | --- | --- |
-| Every wired connection dies at `EnableSessionSSL` with a log line like `tls: handshake r=-1 err=1 errq=… NO_CERTIFICATE_SET` | No usable certificate/key at `/data/local/tmp`: the pair was never installed, is unreadable, or is empty | Install the pair (the `okcar-carkit` `start` verb does it) or copy it from `payload/`; keep `0644`/`0600`; cycle the wired switch |
-| Same failure immediately after a factory reset | `/data/local/tmp` was wiped; nothing in the log mentions a missing file | Reinstall the module or copy the pair from its `payload/` directory, then cycle the wired switch |
-| `tls: cert/key do not match` at the first handshake | The installed certificate and private key are not a pair | Reinstall one matching pair, then restart `okcar-ffs-usbmux` (stop/start the wired switch) |
+| Every wired connection dies at `EnableSessionSSL` with a log line like `tls: handshake r=-1 err=1 errq=… NO_CERTIFICATE_SET` | No usable certificate/key at `/data/local/tmp`: the pair is missing, unreadable or empty | `okcar-port-ctl identity regen` writes a fresh pair and rebuilds a running wired link; `okcar-carkit start` does the same on the next start. Keep `0644`/`0600` |
+| Same failure immediately after a factory reset | `/data/local/tmp` was wiped and the wired start ran before generation existed, or the generator failed (`TLS: 生成证书失败` in `okcar-carkit.log`) | `okcar-port-ctl identity regen`, then cycle the wired switch |
+| `tls: cert/key do not match` at the first handshake | The installed certificate and private key are not a pair — typically one half of a pinned `payload/` pair overwrote one half of a generated one | `okcar-port-ctl identity regen` (it writes both halves) |
 | A newly installed pair does not take effect; handshakes keep failing with the old error until the switch is toggled | `okcar-ffs-usbmux` built its `SSL_CTX` once per process and never re-reads the files | Cycle the wired switch (or reboot); see §4.1 |
 | The head unit never finishes pairing; it keeps re-asking for pairing, or TLS succeeds and the pair record is still rejected | a `DEVICE_PUBKEY_PKCS1_PEM_B64` pinned at build time, or an older flashed binary, no longer matches the installed certificate | leave the constant empty so the key is derived from the certificate, rebuild and reinstall; or regenerate both in one step (§5 steps 4–7) |
 | The session is torn down before `EnableSessionSSL` and the host retries in a loop | Not key material: the host opens with plaintext `GetValue`/`SetValue` and drops a session that ignores them | Confirm the wired binary is the one this repository builds and read the helper/native logs under `/data/local/tmp` (`okcar-carkit.log`, `ffs-usbmux.log`); if that path was edited, keep replies in the framing the request came in |

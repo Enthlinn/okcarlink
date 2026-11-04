@@ -11,6 +11,8 @@
 #   okcar-port-ctl where                        这台机器上的模块目录/id/ctl/守护进程路径
 #   okcar-port-ctl platform                     这台机器的事实（root 框架/Android/WebUI/SE/bt.mac）
 #   okcar-port-ctl status                       全量现状（开关 + DID + 蓝牙地址/名字 + wm size）
+#   okcar-port-ctl identity [regen]             有线 TLS 身份：/data/local/tmp/lockdown-{cert,key}.pem
+#                                               没有就现场生成，regen 强制重新生成
 #
 #   兼容的历史动词（WebUI 与现场脚本仍在用）：
 #   okcar-port-ctl oui | spoof-bt | restore-bt | bt-did | bt-name [name]
@@ -140,6 +142,56 @@ carkit_bin() {
   if [ -n "$OKCAR_CARKIT" ]; then echo "$OKCAR_CARKIT"; return 0; fi
   if [ -x /system/bin/okcar-carkit ]; then echo /system/bin/okcar-carkit
   else echo "$(module_dir)/system/bin/okcar-carkit"; fi
+}
+
+# 有线会话的 TLS 身份。lockdown 的 EnableSessionSSL 要用 /data/local/tmp/lockdown-{cert,key}.pem，
+# 而那两个文件放在 /data/local/tmp —— 恢复出厂就没了，之后每次握手都死在
+# "tls: handshake r=-1 err=1 ... NO_CERTIFICATE_SET"，日志里看不出是缺文件。
+# 干净安装时 okcar-carkit start 自己会补（install_lockdown_identity -> identity_ensure）；
+# 这个动词是给人用的那一份：面板上"重新生成证书"按钮走 identity regen。
+ffs_bin() {
+  if [ -n "$OKCAR_FFS" ]; then echo "$OKCAR_FFS"; return 0; fi
+  if [ -x /system/bin/okcar-ffs-usbmux ]; then echo /system/bin/okcar-ffs-usbmux
+  else echo "$(module_dir)/system/bin/okcar-ffs-usbmux"; fi
+}
+
+# 不需要外部 openssl 二进制：生成逻辑就在 okcar-ffs-usbmux 的 --gen-identity 子命令里
+# （静态链接的 BoringSSL，自签名 RSA-2048 / CN=iPhone / 10 年，PKCS#8 私钥 0600）。
+#
+# daemon 的 SSL_CTX 是**缓存**的（tls_begin 里的 g_ctx），所以换掉磁盘上的那一对之后必须重启
+# 守护进程才生效 —— 有线正跑着的时候这里顺手重建一次 gadget（start 会重新起 daemon）。
+identity_cmd() {
+  _ic=$TMP/lockdown-cert.pem
+  _ik=$TMP/lockdown-key.pem
+  _ib=$(ffs_bin)
+  [ -x "$_ib" ] || { echo "找不到 okcar-ffs-usbmux：$_ib"; return 1; }
+  _state=$(cat "$TMP/okcar-carkit.state" 2>/dev/null)
+  case "${1:-show}" in
+    regen|force|--force)
+      echo "重新生成有线 TLS 身份（自签名 RSA-2048 / CN=iPhone / 10 年）"
+      "$_ib" --gen-identity --force 2>&1 || { echo "生成失败"; return 1; }
+      case "$_state" in
+        started)
+          echo "有线正在跑；守护进程缓存着旧的 SSL_CTX，重建一次 gadget 让它加载新身份"
+          "$(carkit_bin)" start full
+          ;;
+        *)
+          echo "有线当前没在跑（state=${_state:-stopped}）——下次 start 就用这套新身份"
+          ;;
+      esac
+      ;;
+    *)
+      if [ -s "$_ic" ] && [ -s "$_ik" ]; then
+        echo "cert=$_ic ($(wc -c < "$_ic" 2>/dev/null | tr -d ' ') B)"
+        echo "key=$_ik ($(wc -c < "$_ik" 2>/dev/null | tr -d ' ') B)"
+        echo "有线正在用这一对；identity regen 可重新生成"
+      else
+        echo "没有可用的证书对（$_ic / $_ik 不齐）——现在生成"
+        "$_ib" --gen-identity 2>&1 || { echo "生成失败"; return 1; }
+        echo "cert=$_ic ($(wc -c < "$_ic" 2>/dev/null | tr -d ' ') B)"
+      fi
+      ;;
+  esac
 }
 # 主机要用有线链路之前，守护进程必须已经在抽象套接字上提供 com.apple.carkit.service。它把这个请求
 # 记在 /data/local/tmp/okcar-carkit.wanted 里，并自己轮询该文件（2 秒一次），所以在这里写文件就够了
@@ -851,6 +903,7 @@ case "$1" in
     [ -x "$_l" ] || { echo "找不到 okcar-linkd：$_l"; return 1 2>/dev/null || exit 1; }
     "$_l" send stall-clear
     ;;
+  identity) identity_cmd "${2:-show}" ;;
   grant)
     for p in android.permission.RECORD_AUDIO \
              android.permission.BLUETOOTH_CONNECT \
@@ -867,6 +920,6 @@ case "$1" in
     done
     ;;
   *)
-    sed -n '3,25p' "$0"
+    sed -n '3,20p' "$0"
     ;;
 esac

@@ -60,12 +60,14 @@ framework classes and the static native toolchain are not reproducible from the 
 paths are described in `docs/en/building.md`; a `v*` tag attaches the zip and its SHA-256 to a
 release.
 
-Wired mode needs a certificate you generate yourself; the wired daemon reads the advertised public
-key out of it at runtime, so there is nothing to paste into the source:
+Wired mode needs a TLS identity, and the module makes one itself on the first wired start
+(`okcar-ffs-usbmux --gen-identity`, RSA-2048 self-signed) — so a clean install needs no key step at
+all, and `okcar-port-ctl identity regen` (or the WebUI's *Regenerate the TLS identity* button)
+replaces it. Pinning a chosen pair is optional:
 
 ```bash
 mkdir -p lockdown
-# put lockdown-cert.pem + lockdown-key.pem there — see docs/en/crypto.md
+# optionally put lockdown-cert.pem + lockdown-key.pem there — see docs/en/crypto.md
 ```
 
 Then flash `build/okcarlink-1.0.0.zip` in the KernelSU/Magisk manager, reboot, and
@@ -87,11 +89,11 @@ Each document exists in Chinese under `docs/zh/` with the same file name.
 
 ## Security notes
 
-- This repository deliberately ships **no key material**: the wired mode needs a
-  lockdown certificate, and the wired daemon advertises the public key it reads from that
-  certificate at runtime, so every deployment generates its own pair. See
-  [docs/en/crypto.md](docs/en/crypto.md) — without a pair, wired mode simply stays
-  non-functional while the wireless modes keep working.
+- This repository deliberately ships **no key material**: wired mode needs a lockdown TLS
+  identity, and the module generates a self-signed one on the device at the first wired
+  start (`okcar-ffs-usbmux --gen-identity`), then advertises the public key it reads back
+  from that certificate. Every install therefore has its own identity. See
+  [docs/en/crypto.md](docs/en/crypto.md).
 - The release packaging runs a leak gate (private addresses, credentials, key
   material) during `tools/package-module.sh`; it fails the build instead of
   shipping bad content.

@@ -57,12 +57,13 @@ bash tools/package-module.sh      # -> build/okcarlink-1.0.0.zip
 已发布的依赖包（framework jar + 预构建原生）——隐藏 API 的 framework 类与静态原生工具链无法从公开 SDK
 复现。两条路径都写在 `docs/zh/building.md`；打 `v*` tag 时会把 zip 及其 SHA-256 附到 release。
 
-有线模式需要你自己生成证书；有线守护进程在运行期直接从这张证书里读取对外宣告的公钥，所以源码里没有
-任何需要粘贴的常量：
+有线模式需要一份 TLS 身份，而模块会在第一次有线启动时自己生成（`okcar-ffs-usbmux --gen-identity`，
+RSA-2048 自签）——全新安装不需要任何密钥步骤；要更换时用 `okcar-port-ctl identity regen`（或 WebUI
+里的*重新生成 TLS 身份*按钮）。固定一对选定密钥是可选的：
 
 ```bash
 mkdir -p lockdown
-# 将 lockdown-cert.pem + lockdown-key.pem 放入该目录——生成方法见 docs/zh/crypto.md
+# 可选：将 lockdown-cert.pem + lockdown-key.pem 放入该目录——见 docs/zh/crypto.md
 ```
 
 随后在 KernelSU/Magisk 管理器中刷入 `build/okcarlink-1.0.0.zip`，重启，即可从管理器
@@ -84,10 +85,9 @@ mkdir -p lockdown
 
 ## 安全说明
 
-- 本仓库有意**不携带任何密钥材料**：有线模式需要一张 lockdown 证书，有线守护进程在
-  运行期从这张证书里读取并对外宣告其公钥，因此每个部署方都自行生成一对证书/密钥。
-  见 [docs/zh/crypto.md](docs/zh/crypto.md)——没有配对证书时有线模式不可用，
-  但无线模式不受影响。
+- 本仓库有意**不携带任何密钥材料**：有线模式需要一份 lockdown TLS 身份，模块会在第一次
+  有线启动时于设备上自签生成（`okcar-ffs-usbmux --gen-identity`），随后对外宣告从该证书
+  读回的公钥。因此每次安装的身份都是独立的。见 [docs/zh/crypto.md](docs/zh/crypto.md)。
 - 打包脚本 `tools/package-module.sh` 内置外发泄漏闸门（私网地址、凭据、密钥
   材料），一旦命中即中止构建，而非把不该发的内容发出去。
 - 模块运行期写入的文件都位于 `/data/local/tmp`（`okcar-port-*` 状态文件），

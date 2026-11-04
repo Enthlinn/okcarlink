@@ -998,7 +998,9 @@ const ZH = {
   "Actually applied: no session has applied it yet (connect once and the values the encoder really got will show here).": "实际生效：还没有会话应用过（连接一次后这里会显示编码器真正拿到的值）。",
   "incomplete output (probe_end sentinel missing): the command result may have been truncated; check the output panel first": "输出不完整（缺少 probe_end 哨兵）：命令结果可能被截断，先看输出面板",
   "USB adb stops while it is on (the module keeps adb over TCP, port 5555).  Turning the switch off unbinds the gadget and hands USB back to Android as an adb device.": "开着的时候 USB adb 会停（模块保留 TCP 5555 的 adb）；关掉会把 gadget 解绑，把 USB 交回 Android 当 adb 设备。",
-  "Today this covers the control channel: lockdown (StartSession/StartService com.apple.carkit.service) plus the iAP2 session that follows.  The wired AirPlay/NCM half is not implemented yet, so the head unit will not get a picture.": "目前只做到控制通道：lockdown（StartSession/StartService com.apple.carkit.service）加上随后的 iAP2 会话；有线 AirPlay/NCM 那一半还没实现，所以车机拿不到画面。",
+  "The wired session carries the same stack as the wireless one: lockdown, the carkit service, the iAP2 session, then AirPlay over the NCM link.  It needs a TLS identity on the phone (/data/local/tmp/lockdown-cert.pem + lockdown-key.pem); if the pair is missing the handshake dies at EnableSessionSSL, so the module generates a self-signed one when it starts.": "有线会话跑的是和无线同一套：lockdown、carkit service、iAP2 会话，然后走 NCM 链路的 AirPlay。它需要手机上有一份 TLS 身份（/data/local/tmp/lockdown-cert.pem + lockdown-key.pem）；没有的话握手会死在 EnableSessionSSL，所以模块启动时会自己生成一份自签名的。",
+  "Regenerate the TLS identity": "重新生成证书",
+  "Rewrites /data/local/tmp/lockdown-cert.pem and lockdown-key.pem with a fresh self-signed pair; a running wired link is rebuilt so the daemon loads it.": "用一对新的自签名证书覆盖 /data/local/tmp/lockdown-cert.pem 与 lockdown-key.pem；有线正在跑时会重建链路，让守护进程加载新的这一对。",
   "What it does: while a mirror/cast session runs, the three system animation scales (window/transition/animator) are forced to 0 and the values found before the session are restored when it ends. It removes the frame spike when opening an app in mirror mode.": "作用：镜像/投屏会话期间把系统三个动画时长（window/transition/animator）强制置 0，会话结束时把会话前读到的原值写回。用来去掉镜像模式下开应用那一帧的尖峰。",
   "On: this phone re-enumerates over USB as an Apple device (05ac:12a8) with the USBMUX interface and NCM, so a CarPlay host (a head unit, or the emulator on a second phone) can run wired CarPlay against it.  Off by default because it takes the whole USB port over.": "打开：本机在 USB 上重新枚举成 Apple 设备（05ac:12a8，带 USBMUX 接口和 NCM），说 CarPlay 的 USB 主机（车机，或第二台手机上的模拟器）就能对它跑有线 CarPlay。默认关闭，因为它会占掉整个 USB 口。",
   "It defaults to OFF: it used to default to on, so it \"suddenly\" took effect whenever the switch file was rebuilt, and this panel had no row for it (reported 2026-10-07). Turning the switch off also restores your saved scales immediately, without waiting for the next session.": "默认关闭：它以前默认开，所以每次开关文件重建后都会\"突然生效\"，而面板上又没有这一行（2026-10-07 反馈）。关掉这个开关会立即把保存的动画比例还原，不用等下一次会话。",
@@ -1317,9 +1319,10 @@ const CATS = [
         + 'against it.  Off by default because it takes the whole USB port over.',
       'USB adb stops while it is on (the module keeps adb over TCP, port 5555).  Turning the switch off '
         + 'unbinds the gadget and hands USB back to Android as an adb device.',
-      'Today this covers the control channel: lockdown (StartSession/StartService '
-        + 'com.apple.carkit.service) plus the iAP2 session that follows.  The wired AirPlay/NCM half is '
-        + 'not implemented yet, so the head unit will not get a picture.',
+      'The wired session carries the same stack as the wireless one: lockdown, the carkit service, the '
+        + 'iAP2 session, then AirPlay over the NCM link.  It needs a TLS identity on the phone '
+        + '(/data/local/tmp/lockdown-cert.pem + lockdown-key.pem); if the pair is missing the handshake '
+        + 'dies at EnableSessionSSL, so the module generates a self-signed one when it starts.',
     ],
     health: (s) => {
       const f = s.wire_fact || '';
@@ -1350,6 +1353,7 @@ const CATS = [
       { label: 'Wired status', cmd: (p) => 'sh ' + q(p.carkit) + ' status 2>&1 | tail -12' },
       { label: 'Rebuild the USB gadget', warn: 'Unbinds and re-creates the gadget, then re-enumerates as an iPhone.', cmd: (p) => 'sh ' + q(p.carkit) + ' start full 2>&1 | tail -12' },
       { label: 'Give USB back to Android', warn: 'Unbinds the gadget, restores sys.usb.config=adb and turns the Java side off.', cmd: (p) => 'sh ' + q(p.carkit) + ' stop 2>&1 | tail -6' },
+      { label: 'Regenerate the TLS identity', warn: 'Rewrites /data/local/tmp/lockdown-cert.pem and lockdown-key.pem with a fresh self-signed pair; a running wired link is rebuilt so the daemon loads it.', cmd: (p) => q(p.ctl) + ' identity regen 2>&1 | tail -12' },
       { label: 'Reclaim a stray Apple gadget', warn: 'Unbinds and clears any gadget that claims to be an iPhone (including one built outside this module), then hands USB back to Android.', cmd: (p) => 'sh ' + q(p.carkit) + ' reclaim 2>&1 | tail -8' },
     ],
   },

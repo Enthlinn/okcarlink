@@ -53,13 +53,15 @@ lockdown 对话很短，但顺序很关键：
 
 - 模块在车机上以 root 运行。提交进仓库的私钥会在每个 fork 里公开、在每次安装里完全相同——任何人都
   能构建一个出示同一设备身份的模块。
-- 因此 `tools/package-module.sh` 只从构建者取密钥对，绝不从源码树里取：它把
-  `lockdown/lockdown-cert.pem` 与 `lockdown/lockdown-key.pem`（gitignored，构建者提供）复制进暂存的
-  `payload/` 目录；两者缺失时打印一条提示并继续——有线模式就是无法完成 `EnableSessionSSL`。
+- 因此 `tools/package-module.sh` 绝不从源码树里取密钥对：`lockdown/lockdown-cert.pem` 与
+  `lockdown/lockdown-key.pem`（gitignored，构建者提供）存在时复制进暂存的 `payload/` 目录，缺失时
+  打印一条提示。有线模式并不需要它们：模块会在第一次有线启动时自己生成一对（见 4.3）。
 - 扫描每个暂存文件的私钥泄漏闸门恰好豁免这两个文件：每次安装都必须出示真实的密钥对，所以它们的存在
   是刻意的，而它们的内容不公开。
-- 模块**确实**在 payload 里带一份密钥对，因为 `/data/local/tmp` 会被恢复出厂设置清空，而一个被清空的
-  车机完全跑不了有线模式。把它放进 `payload/`，让重装（或助手自己的安装步骤）成为一条命令的恢复。
+- `/data/local/tmp` 会被恢复出厂设置清空，所以这份身份必须能在设备本机重建。
+  `okcar-ffs-usbmux --gen-identity` 用它已经链接进来的 BoringSSL 做这件事：RSA-2048、自签、
+  `CN=iPhone`、v3、sha256WithRSA、十年（见 4.3）。放进 `payload/` 的密钥对是可选的，只用于固定一对选定
+  的身份。
 
 ## 4. 密钥对从哪里读取
 
@@ -67,13 +69,16 @@ lockdown 对话很短，但顺序很关键：
 | --- | --- |
 | 设备上（证书） | `/data/local/tmp/lockdown-cert.pem`，权限 `0644`——`LOCKDOWN_CERT`，`native/ffs-usbmux/okcar-ffs-usbmux.c:100` |
 | 设备上（私钥） | `/data/local/tmp/lockdown-key.pem`，权限 `0600`——`LOCKDOWN_KEY`，`native/ffs-usbmux/okcar-ffs-usbmux.c:101` |
-| zip 内的来源 | `payload/lockdown-cert.pem`、`payload/lockdown-key.pem` |
+| zip 内的来源 | `payload/lockdown-cert.pem`、`payload/lockdown-key.pem`（可选——用于固定选定的一对） |
+| 设备现场生成 | `okcar-ffs-usbmux --gen-identity`，密钥对缺失时由 `okcar-carkit` 调用 |
 | 构建者输入 | `lockdown/lockdown-cert.pem`、`lockdown/lockdown-key.pem`（仓库根，gitignored） |
 
-`module/system/bin/okcar-carkit` 里的 `install_lockdown_identity()` 负责这次复制
-（`module/system/bin/okcar-carkit:771`，由 `start` verb 在 `:1281` 调用）。它保留上面两个权限、目标已
-完全一致时跳过（`cmp`），并在密钥对缺失时于启动时就明说"有线会在 `EnableSessionSSL` 失败"。它
-不把密钥对与公布的常量做交叉校验——不匹配只在握手里才可见。
+`module/system/bin/okcar-carkit` 里的 `install_lockdown_identity()`（`:771`，由 `start` verb 在 `:1281`
+调用）按三个来源依次确定身份：模块带了固定密钥对时用 `payload/lockdown-*.pem`，否则用
+`/data/local/tmp` 里已有的，再否则交给 `identity_ensure()`——它执行 `okcar-ffs-usbmux --gen-identity`，
+并打印 `TLS: 已现场生成自签名身份（CN=iPhone）`。上面两个权限在每条路径上都会被保留；它不把密钥对与
+公布的常量做交叉校验——不匹配只在握手里才可见。`okcar-port-ctl identity` 打印当前装的是哪一份，
+`okcar-port-ctl identity regen` 强制换一对。
 
 ### 4.1 注意事项：SSL 上下文每进程只建一次
 
@@ -88,15 +93,25 @@ lockdown 对话很短，但顺序很关键：
 
 ### 4.2 注意事项：恢复出厂设置会抹掉密钥对
 
-`/data/local/tmp` 会被恢复出厂设置清空。此后的故障没有任何"某个文件不见了"的提示：usbmux 依旧枚举、
-TLS 服务端依旧就绪，然后每次握手都死在 `EnableSessionSSL`（这是记录在案的事故，不是假想）。恢复办法是
-重装模块、或从其 `payload/` 目录复制一份密钥对过去，然后让有线开关走完一轮。模块随包发布密钥对的全部
-理由就在这里。
+`/data/local/tmp` 会被恢复出厂设置清空。若没有现场生成，此后的故障没有任何"某个文件不见了"的提示：
+usbmux 依旧枚举、TLS 服务端依旧就绪，然后每次握手都死在 `EnableSessionSSL`（这是记录在案的事故，不是
+假想）。有了启动路径里的 `identity_ensure()`，这个事故到不了主机：下一次有线启动会先生成一对。如果某台
+设备上仍然出现，说明那次有线启动跑的是旧二进制，或生成本身失败了（日志里是 `TLS: 生成证书失败`）；
+`okcar-port-ctl identity regen` 就是一条命令的恢复。
 
-## 5. 生成自己的密钥对
+### 4.3 注意事项：现场生成的身份就是一份新的设备身份
 
-下面的命令都在仓库根执行，且只写进 gitignored 的 `lockdown/` 目录（`tools/package-module.sh` 从那里
-取）。全部是普通 `openssl`；生成这份身份不需要本仓库的任何东西。
+这套协议里没有任何地方钉死某一个公钥，主机每次配对都会从 `GetValue DevicePublicKey` 重新学到它，
+所以现场生成的一对与随包发布的一对表现相同。有两个后果值得知道：两台各自生成过密钥对的手机对主机而
+言是可区分的；在有线链路活着时换密钥对需要重建链路——4.1 的规则适用，而 `okcar-carkit.state` 处于
+`started` 时 `okcar-port-ctl identity regen` 会自动重建。
+
+## 5. 在宿主机上生成自己的密钥对（可选）
+
+这一步完全可以不做：`okcar-ffs-usbmux --gen-identity` 会在设备上生成等价的一对（见 4.3），全新安装
+走的就是那条路。只有当你想要一份选定的身份时——比如整批设备共用同一对，或在首次开机前把一对放进
+`payload/`——才在这里做。下面的命令都在仓库根执行，且只写进 gitignored 的 `lockdown/` 目录
+（`tools/package-module.sh` 从那里取）。全部是普通 `openssl`；生成这份身份不需要本仓库的任何东西。
 
 **1. 生成自签证书与私钥。**
 
@@ -169,26 +184,28 @@ tools/package-module.sh
 ```
 
 它运行 `native/ffs-usbmux/build.sh`（运行期推导与可选的固定常量都在这个二进制里）、dex 构建、暂存
-`module/`、把 `lockdown/` 密钥对复制进 `stage/payload/`、写入 WebUI variant、跑泄漏闸门，最后产出
-发布 zip。原生构建需要 AOSP 树（见 `docs/zh/architecture.md`），因为它从树里链接静态 BoringSSL 与静态
+`module/`、在 `lockdown/` 里有密钥对时把它复制进 `stage/payload/`（没有时打印
+`note: lockdown/<file> absent`，属于正常、不是缺陷）、写入 WebUI variant、跑泄漏闸门，最后产出发布
+zip。原生构建需要 AOSP 树（见 `docs/zh/architecture.md`），因为它从树里链接静态 BoringSSL 与静态
 bionic。
 
-**8. 校验发布产物。**
+**8. 校验发布产物（仅当你固定了一对密钥）。**
 
-打包后，确认暂存 payload 里的密钥对就是你构建的那一对：用第 2–3 步的两个摘要比较，对象是
-`stage/payload/lockdown-cert.pem` 与 `lockdown/lockdown-key.pem`。如果你在第 6 步固定了常量，再用同一个
-密钥核对它——固定常量是宣告公钥与证书仍可能不一致的唯一途径，而故障只会在车里才显形。
+若你把密钥对放进了 `lockdown/`，确认暂存 payload 里的那份就是你构建的那一对：用第 2–3 步的两个摘要
+比较，对象是 `stage/payload/lockdown-cert.pem` 与 `lockdown/lockdown-key.pem`。如果你在第 6 步固定了
+常量，再用同一个密钥核对它——固定常量是宣告公钥与证书仍可能不一致的唯一途径，而故障只会在车里才显形。
+没有 `lockdown/` 目录的构建根本不会带密钥对，也不需要做这些；设备会在第一次有线启动时自己生成。
 
 ## 6. 故障排查
 
 | 现象 | 原因 | 处理 |
 | --- | --- | --- |
-| 每条有线连接都死在 `EnableSessionSSL`，日志形如 `tls: handshake r=-1 err=1 errq=… NO_CERTIFICATE_SET` | `/data/local/tmp` 没有可用的证书/私钥：从未安装、不可读、或为空 | 安装密钥对（`okcar-carkit` 的 `start` verb 会做）或从 `payload/` 复制；保持 `0644`/`0600`；让有线开关走完一轮 |
-| 恢复出厂设置后立刻同样的失败 | `/data/local/tmp` 被清空，而日志里没有任何地方提示缺文件 | 重装模块或从其 `payload/` 目录复制密钥对，然后让有线开关走完一轮 |
-| 第一次握手时报 `tls: cert/key do not match` | 装上去的证书与私钥不是一对 | 装一份匹配的密钥对，然后重启 `okcar-ffs-usbmux`（有线开关 off/on） |
+| 每条有线连接都死在 `EnableSessionSSL`，日志形如 `tls: handshake r=-1 err=1 errq=… NO_CERTIFICATE_SET` | `/data/local/tmp` 没有可用的证书/私钥：缺失、不可读、或为空 | `okcar-port-ctl identity regen` 会写一对新的并重建正在跑的有线链路；下一次 `okcar-carkit start` 也会这么做。保持 `0644`/`0600` |
+| 恢复出厂设置后立刻同样的失败 | `/data/local/tmp` 被清空，而那一次有线启动跑的还是没有现场生成的旧二进制，或生成失败（`okcar-carkit.log` 里是 `TLS: 生成证书失败`） | 执行 `okcar-port-ctl identity regen`，然后让有线开关走完一轮 |
+| 第一次握手时报 `tls: cert/key do not match` | 装上去的证书与私钥不是一对——通常是 `payload/` 里固定密钥对的一半覆盖了现场生成的一半 | `okcar-port-ctl identity regen`（它两半一起写） |
 | 新装的密钥对不生效；开关不拨就一直用旧错误失败 | `okcar-ffs-usbmux` 每进程只建一次 `SSL_CTX`，不会重读文件 | 让有线开关走完一轮（或重启机器）；见 4.1 |
 | 设备日志出现 `lockdown: WARNING: no DevicePublicKey available - install the lockdown pair first`，或主机记录里的公钥为空 | 主机来索取时证书还没装好，`GetValue DevicePublicKey` 只能回空 `<data>` | 安装密钥对并让有线开关走完一轮（见上） |
-| 车机迟迟配不对；反复要求配对，或 TLS 成功但 pair 记录仍被拒 | 构建期固定的 `DEVICE_PUBKEY_PKCS1_PEM_B64`（或设备上仍是旧二进制）与已装证书不再匹配 | 让常量为空，改为从证书推导，重新构建并重新安装；或密钥对与常量一次性一起换（第 5 节第 4–7 步） |
+| 车机迟迟配不对；反复要求配对，或 TLS 成功但 pair 记录仍被拒 | 构建期固定的 `DEVICE_PUBKEY_PKCS1_PEM_B64`（或设备上仍是旧二进制）与已装证书不再匹配 | 让常量为空，改为从证书推导，重新构建并重新安装；或执行 `okcar-port-ctl identity regen` 让证书跟常量对齐（第 5 节第 4–6 步） |
 | 会话在 `EnableSessionSSL` 之前就被拆掉，主机循环重试 | 不是密钥材料问题：主机以明文 `GetValue`/`SetValue` 开场，会拆掉忽略它们的会话 | 确认有线二进制就是本仓库构建出来的那个，并读 `/data/local/tmp` 下的助手/原生日志（`okcar-carkit.log`、`ffs-usbmux.log`）；如果改过这条路径，让应答保持请求进来时的成帧方式 |
 
 ## 7. 不要与 AirPlay 身份混淆

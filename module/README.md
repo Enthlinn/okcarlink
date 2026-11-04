@@ -16,9 +16,11 @@ repository root; flash that zip, do not copy this folder onto the device by hand
 5. On the phone: connect to the head unit's Wi-Fi / hotspot and wait for the
    CarPlay or AirPlay prompt.
 
-Wired mode needs a lockdown identity that matches the public key compiled into
-`okcar-ffs-usbmux`. Generate your own pair before building — see
-`docs/en/crypto.md`. The wireless modes work without any key material.
+Wired mode needs a lockdown TLS identity, and the module generates one on its
+first wired start (self-signed RSA-2048). Nothing has to be prepared before
+building; to replace it later use the WebUI action or `okcar-port-ctl identity
+regen`. See `docs/en/crypto.md`. The wireless modes work without any key
+material.
 
 Runtime files are written under `/data/local/tmp` (`okcar-port-*` state files,
 logs); uninstalling the module removes them.
@@ -36,8 +38,9 @@ logs); uninstalling the module removes them.
    `okcar-port-panel url` 打印的地址（127.0.0.1:8088，带 token）。
 5. 手机侧：连接车机 Wi-Fi / 热点，等待 CarPlay 或 AirPlay 弹窗确认。
 
-有线模式需要一对 lockdown 证书/密钥，其公钥必须与编译进 `okcar-ffs-usbmux` 的常量
-一致——请在构建前自行生成，方法见 `docs/zh/crypto.md`。无线模式无需任何密钥材料。
+有线模式需要一份 lockdown TLS 身份，模块会在第一次有线启动时自己生成（RSA-2048 自签）。
+构建前无需准备任何东西；日后要更换，用 WebUI 里的操作或 `okcar-port-ctl identity
+regen`。详见 `docs/zh/crypto.md`。无线模式无需任何密钥材料。
 
 运行期文件写在 `/data/local/tmp`（`okcar-port-*` 状态文件与日志），卸载模块时
 会被清理。

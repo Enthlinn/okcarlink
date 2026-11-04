@@ -53,11 +53,21 @@ sysroot ships with this repository.
 Paths below are relative to that root; the scripts `cd` to their own directory and derive the root themselves, so they
 work from any working directory.
 
-### 2.2 Step 2 — generate the lockdown identity (optional; required for wired mode)
+### 2.2 Step 2 — the lockdown identity (optional; the module makes one itself)
 
-Wired CarPlay must present a certificate to the head unit's lockdown handshake, so a wired-capable build needs one key
-pair you generate yourself: the repository ships no key material, because a root module whose private key is public in
-every fork would be identical in every install. The rationale and failure modes are in `docs/en/crypto.md`; the commands repeat here so this page is self-contained, and they write only into the gitignored `lockdown/` (run from the repository root).
+Wired CarPlay must present a certificate to the head unit's lockdown handshake. The repository ships no key material,
+because a root module whose private key is public in every fork would be identical in every install — so the pair is
+created on first use instead: `okcar-carkit` runs `okcar-ffs-usbmux --gen-identity` when
+`/data/local/tmp/lockdown-{cert,key}.pem` are missing, and the native writes a self-signed RSA-2048 certificate
+(`CN=iPhone`, v3, sha256WithRSA, ten years) with the BoringSSL it already links. A clean install therefore needs no
+host step at all, and `/data/local/tmp` being wiped by a factory reset only means the pair is generated again on the
+next wired start. To replace it later, use *Regenerate the TLS identity* in the WebUI's wired panel, or
+`okcar-port-ctl identity regen`; `okcar-port-ctl identity` alone reports what is installed. Rationale and failure
+modes are in `docs/en/crypto.md`.
+
+Generate one on the host instead when you want a chosen identity — for example to distribute the same pair to a fleet,
+or to have it inside `payload/` from the first boot. These commands write only into the gitignored `lockdown/` (run
+from the repository root):
 
     mkdir -p lockdown
     openssl req -x509 -newkey rsa:2048 -keyout lockdown/lockdown-key.pem \
@@ -75,7 +85,7 @@ other:
 The advertised public key is **not compiled in**. `okcar-ffs-usbmux` extracts the PKCS#1 public half from the
 certificate it installs (`/data/local/tmp/lockdown-cert.pem`) and answers `GetValue DevicePublicKey` with that, so the
 advertised key cannot disagree with the certificate the same binary presents — the classic wired-mode failure this
-page used to warn about. Generating the pair above is therefore the whole step.
+page used to warn about. That holds for a generated pair and for one you supply.
 
 If you would rather keep a compiled-in value, `DEVICE_PUBKEY_PKCS1_PEM_B64` in
 `native/ffs-usbmux/okcar-ffs-usbmux.c` is still honoured when non-empty; the PKCS#1 form is required (plain `-pubout`
@@ -83,11 +93,9 @@ emits SubjectPublicKeyInfo, which the head unit rejects):
 
     openssl rsa -in lockdown/lockdown-key.pem -RSAPublicKey_out | base64 -w0   # about 568 characters for RSA-2048
 
-The packager copies `lockdown/lockdown-{cert,key}.pem` into `payload/`, because `/data/local/tmp` is wiped by a factory
-reset and the pair has to come back with the module. A mirror-only build needs none of this: without the pair the
-packager prints `note: lockdown/<file> missing -- wired mode cannot complete EnableSessionSSL` and continues, and the
-wired native logs `no DevicePublicKey available` if a host asks for the key anyway.
-
+The packager copies `lockdown/lockdown-{cert,key}.pem` into `payload/` when they exist and silently leaves them out
+when they do not, because the module can generate its own; the `note: lockdown/<file> absent` line it prints is
+informational, not a defect. Shipping a pair in `payload/` only saves the first-use generation.
 ### 2.3 Step 3 — build the native helpers
 
     TREE=/path/to/aosp native/uinputd/build.sh      # -> build/okcar-uinputd
@@ -166,7 +174,7 @@ leaks into a release); copies the built artifacts, printing a note when one is a
 | `note: build/okcar-uinputd missing -- the matching feature reports its daemon as unavailable at runtime` | mirroring works, touches do not reach the car screen; with `REQUIRE_ARTIFACTS=1` this aborts instead |
 | `note: build/okcar-ffs-usbmux missing -- ...` (same wording) | the wired switch cannot bind the gadget |
 | `note: build/okcar-link.dex missing -- ...` (same wording) | the module installs but the daemon never starts |
-| `note: lockdown/<file> missing -- wired mode cannot complete EnableSessionSSL` | wired mode fails at the TLS handshake instead of at startup |
+| `note: lockdown/<file> absent -- the module will generate a self-signed identity on first wired start` | nothing is wrong: `payload/` carries no pinned pair, so the first wired start generates one (§2.2) |
 
 Then: write the distribution variant marker `lite` into `webroot/variant`; apply explicit modes, because a workspace usually stores everything `0600` and a `0600` helper is not executable while a
 `0600` `.idc` misclassifies the injected touchscreen as a plain pointer — `0755` on `post-fs-data.sh`, `service.sh`,
@@ -246,15 +254,18 @@ Then check the logs and state, all under `/data/local/tmp`:
 
 For the wireless path, the protocol self-tests in `daemon/src` are pure Java: `com.okcar.link.wireless.WirelessSelfTest` and its siblings have a `main()` and run on a host JVM with plain `javac`/`java` — no device and no AOSP tree. The optional Wi-Fi self-test reads `okcar-wifi-selftest.conf` (`ssid=`/`passphrase=`) when present; keep those values out of committed files.
 
-For wired mode, only **after** the lockdown pair exists:
+For wired mode:
 
     okcar-port-ctl switch wired on        # deliberately reconfigures USB and binds the Apple gadget
 
-`okcar-carkit` installs the pair to `/data/local/tmp/lockdown-cert.pem` (mode `0644`) and
-`/data/local/tmp/lockdown-key.pem` (mode `0600`), skipping the copy when they already match; the native server listens on lockdownd port `62078` and talks to the Java side over the abstract socket `okcar-carkit`. A newly
-installed pair takes effect only after the wired switch is cycled, because each process builds its TLS context once; a
-mismatch is reported once as `tls: cert/key do not match`. Without a pair the handshake fails at `EnableSessionSSL`
-with `NO_CERTIFICATE_SET` — full row set in `docs/en/crypto.md` §6.
+`okcar-carkit` first copies `payload/lockdown-{cert,key}.pem` into `/data/local/tmp` when the module ships a pinned
+pair, and otherwise (or when only one half is present) runs `okcar-ffs-usbmux --gen-identity`, which writes
+`/data/local/tmp/lockdown-cert.pem` (mode `0644`) and `/data/local/tmp/lockdown-key.pem` (mode `0600`) and logs
+`TLS: 已现场生成自签名身份（CN=iPhone）`. The native server listens on lockdownd port `62078` and talks to
+the Java side over the abstract socket `okcar-carkit`. A newly installed pair takes effect only after the wired switch
+is cycled, because each process builds its TLS context once; a mismatch is reported once as `tls: cert/key do not
+match`. `okcar-port-ctl identity` reports what is installed and `identity regen` replaces it — full row set in
+`docs/en/crypto.md` §6.
 
 ### 2.8 Step 8 — CI on a hosted runner
 
@@ -308,9 +319,9 @@ bundle above, and one `tools/package-module.sh` for both.
 | `okcar-port-check` exits 1 with a "not found / not executable" message | the zip lacks `okcar-linkd` or `okcar-port-ctl`, or the module directory was renamed again | rebuild from a complete `module/` staging; the message names which file was missing |
 | Wired switch reports the daemon missing; UDC never binds | `build/okcar-ffs-usbmux` was skipped | rebuild with `TREE` set and re-flash (§2.3) |
 | Mirroring on the head unit but no touches on the car screen | `build/okcar-uinputd` was skipped | same |
-| `NO_CERTIFICATE_SET` at `EnableSessionSSL` — "no certificate set" | the pair was never installed, is unreadable or empty, including right after a factory reset because `/data/local/tmp` is wiped | cycle the wired switch so `okcar-carkit` re-installs `/data/local/tmp/lockdown-{cert,key}.pem`; full row set and the mismatch case in `docs/en/crypto.md` §6 |
-| `tls: cert/key do not match` in the wired log | `lockdown/lockdown-cert.pem` and `lockdown/lockdown-key.pem` are not one pair | regenerate one matching pair (§2.2) and reinstall |
-| A newly installed pair has no effect | each process builds its TLS context once | cycle the wired switch, or restart the module |
+| `NO_CERTIFICATE_SET` at `EnableSessionSSL` — "no certificate set" | the pair is missing, unreadable or empty — a factory reset wipes `/data/local/tmp`, and generation only runs during a wired start | cycle the wired switch so `okcar-carkit` generates the pair, or run `okcar-port-ctl identity regen`; full row set and the mismatch case in `docs/en/crypto.md` §6 |
+| `tls: cert/key do not match` in the wired log | the installed certificate and key are not one pair (a pinned `payload/` pair overwrote one half) | `okcar-port-ctl identity regen`, which writes a matching pair (§2.2) |
+| A newly installed pair has no effect | each process builds its TLS context once | cycle the wired switch, or restart the module — `okcar-port-ctl identity regen` does it for you when wired is running |
 | `LEAK: <file>` ... `aborted`, exit 1, no zip produced | a staged file matches one of the three pattern groups | the output names the file and up to five matched literals; remove the content and re-run |
 | A build "succeeded" but the zip contains last week's binaries | a skipped build was silently satisfied by a leftover `build/` artifact | `rm -rf build/` and rebuild (§2.5) |
 | `REQUIRE_ARTIFACTS=1: refusing to package an incomplete module`, exit 1 | one of the three artifacts was absent and CI-style strictness is on | build the missing piece with `TREE` set, or fetch the dependency bundle (§2.8) |
@@ -343,8 +354,9 @@ where a phone is named.
 
 *  `bash -n` on all five scripts: `tools/build-daemon.sh`, `tools/package-module.sh`, `tools/make-aosp-deps.sh` and
 both native builders.
-*  A real build ran: `TREE=... bash tools/package-module.sh` produced a single 804,120-byte `build/okcar-link.dex`,
-`build/okcar-uinputd` (1,964,472 B) and `build/okcar-ffs-usbmux` (9,397,744 B) — both natives confirmed by `file` as
+*  A real build ran: `TREE=... bash tools/package-module.sh` produced a single 805,580-byte `build/okcar-link.dex`,
+`build/okcar-uinputd` (1,964,472 B) and `build/okcar-ffs-usbmux` (9,416,576 B, the identity generator included) — both
+natives confirmed by `file` as
 `ELF 64-bit LSB executable, ARM aarch64, statically linked, for Android 33` — and a 36-file `build/okcarlink-1.0.0.zip`.
 *  The CI path was run locally, without an AOSP checkout: `FRAMEWORK_JARS=<bundle>/framework-jars ANDROID_JAR=...
 D8_JAR=... REQUIRE_ARTIFACTS=1 bash tools/package-module.sh` recompiled `daemon/src` against the bundle's framework
@@ -357,12 +369,19 @@ back after a reboot as `okcarlink 1.0.0 (100)`, `service.sh` started `app_proces
 (recorded in `/data/local/tmp/okcar-linkd.status`), the wired helper bound `/dev/usb-ffs/okcar/ep0`, and the device-side
 SHA-256 of the dex and both natives matched the host build byte for byte.
 *  The leak gate and its `LEAK: <file>` failure mode were exercised against the staged tree while preparing the release.
+*  The self-generating identity was exercised on the same device: with `/data/local/tmp/lockdown-*.pem` deleted, a wired start logged `TLS: 已现场生成自签名身份（CN=iPhone）` and wrote a 969-byte `lockdown-cert.pem` (`0644`) plus a
+1,704-byte `lockdown-key.pem` (`0600`); `openssl x509` on the host reads it back as `CN=iPhone`, self-signed, RSA-2048,
+v3, sha256WithRSA, ten years. `okcar-port-ctl identity` reports the sizes and `identity regen` replaces the pair.
+*  Wired CarPlay completed end to end on that device with a generated pair and no manual host step: `carkit: wired control
+channel accepted` → `iAP2 link up` → `announced CarPlay availability 0x4300` → `accessory asked to start the CarPlay
+session: WIRED address=fe80::2:7000` → `fe80::2%usb0 recovered after in-dial route re-assert` → `pair-setup done` →
+HEVC 1080x2400@60 video and opus audio streaming (`49.4`–`50.2` fps over twelve consecutive reports, `droppedByFps=0`,
+`droppedByBacklog=0`, audio `50.0 packets/s` target `50/s`). The far end was a head-unit emulator, not a production
+head unit.
 
-Not verified, therefore still **untested**: the lockdown handshake against a real head unit end to end. The
-`DevicePublicKey` reply is now extracted from the installed certificate at runtime; that code path is compiled and
-ships, but it has not been observed completing a pairing against a car, and neither has the older compiled-in form.
-The remaining wired-mode statements in §2.7 and `docs/en/crypto.md` come from the protocol implementation and recorded
-sessions, not from a fresh measurement.
+Not verified, therefore still **untested**: the wired path against a production head unit — the session above ran
+against an emulator. Reported successes there should be reproducible, but nothing here has been measured against a
+shipped car head unit, and the wireless pairing self-tests still read recorded vectors rather than a live phone.
 
 ## 6. Sources
 

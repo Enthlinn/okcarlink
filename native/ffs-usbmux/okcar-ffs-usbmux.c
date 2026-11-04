@@ -33,6 +33,7 @@
 #include <sys/time.h>
 #include <time.h>
 #include <sys/un.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #include <pthread.h>
 #include <openssl/ssl.h>
@@ -41,6 +42,9 @@
 #include <openssl/evp.h>
 #include <openssl/pem.h>
 #include <openssl/x509.h>
+#include <openssl/rsa.h>
+#include <openssl/bn.h>
+#include <openssl/rand.h>
 
 #include "lockdown_proto.h"
 
@@ -108,6 +112,7 @@ static const char DEVICE_PUBKEY_PKCS1_PEM_B64[] =
     "";
 #define LOCKDOWN_CERT "/data/local/tmp/lockdown-cert.pem"
 #define LOCKDOWN_KEY "/data/local/tmp/lockdown-key.pem"
+#define IDENTITY_CN "iPhone"
 
 /* Base64 of the PKCS#1 public-key PEM read from the installed lockdown certificate.
  * Writes '\0' to out[0] and returns 0 when no usable certificate is present. */
@@ -145,6 +150,105 @@ static int device_pubkey_from_cert(char *out, size_t out_len)
     if (EVP_EncodeBlock((unsigned char *)out, (const unsigned char *)pem, (size_t)pl) <= 0) return 0;
     return 1;
 }
+
+/* --- lockdown identity generation ------------------------------------------------------------
+ * A wired session cannot complete EnableSessionSSL without a certificate pair, and no key
+ * material ships with this repository.  Rather than making every builder run openssl, the
+ * binary that needs the pair can make one: BoringSSL is already linked in for TLS, so
+ * RSA + a self-signed X509 costs nothing extra.
+ *     okcar-ffs-usbmux --gen-identity [--force]
+ * Shape kept compatible with the pairs hosts have accepted so far: CN=iPhone, RSA-2048,
+ * SHA-256 with RSA, ten years, self-signed.  Written where device_pubkey_from_cert() and
+ * tls_begin() look for them (LOCKDOWN_CERT / LOCKDOWN_KEY); the key is 0600, the cert 0644.
+ * Exit: 0 generated or already present, 1 failure. */
+
+static int identity_write(const char *path, const char *data, size_t len, mode_t mode)
+{
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, mode);
+    size_t off = 0;
+    if (fd < 0) {
+        fprintf(stderr, "identity: cannot write %s (errno=%d)\n", path, errno);
+        return 0;
+    }
+    while (off < len) {
+        ssize_t n = write(fd, data + off, len - off);
+        if (n <= 0) {
+            fprintf(stderr, "identity: write %s failed (errno=%d)\n", path, errno);
+            close(fd);
+            return 0;
+        }
+        off += (size_t)n;
+    }
+    fchmod(fd, mode);
+    close(fd);
+    return 1;
+}
+
+static int gen_identity(int force)
+{
+    EVP_PKEY *pkey = NULL;
+    RSA *rsa = NULL;
+    BIGNUM *e = NULL;
+    X509 *cert = NULL;
+    X509_NAME *name = NULL;
+    BIO *kbio = NULL, *cbio = NULL;
+    char *kptr = NULL, *cptr = NULL;
+    long klen, clen;
+    int rc = -1;
+
+    if (!force && access(LOCKDOWN_CERT, R_OK) == 0 && access(LOCKDOWN_KEY, R_OK) == 0) {
+        fprintf(stderr, "identity: %s already present (pass --force to replace it)\n", LOCKDOWN_CERT);
+        return 0;
+    }
+    fprintf(stderr, "identity: generating a self-signed RSA-2048 certificate (CN=%s)\n", IDENTITY_CN);
+
+    pkey = EVP_PKEY_new();
+    rsa = RSA_new();
+    e = BN_new();
+    if (!pkey || !rsa || !e) goto done;
+    if (!BN_set_word(e, RSA_F4)) goto done;
+    if (!RSA_generate_key_ex(rsa, 2048, e, NULL)) goto done;
+    if (!EVP_PKEY_assign_RSA(pkey, rsa)) goto done;
+    rsa = NULL;                        /* owned by pkey from here on */
+
+    cert = X509_new();
+    if (!cert) goto done;
+    if (!X509_set_version(cert, 2)) goto done;                    /* v3 */
+    if (!ASN1_INTEGER_set(X509_get_serialNumber(cert), (long)time(NULL))) goto done;
+    if (!X509_gmtime_adj(X509_getm_notBefore(cert), -3600L)) goto done;   /* one hour of clock skew */
+    if (!X509_gmtime_adj(X509_getm_notAfter(cert), 10L * 365 * 24 * 3600)) goto done;
+    name = X509_get_subject_name(cert);
+    if (!name) goto done;
+    if (!X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC,
+                                    (const unsigned char *)IDENTITY_CN, -1, -1, 0)) goto done;
+    if (!X509_set_issuer_name(cert, name)) goto done;             /* self-signed */
+    if (!X509_set_pubkey(cert, pkey)) goto done;
+    if (!X509_sign(cert, pkey, EVP_sha256())) goto done;
+
+    kbio = BIO_new(BIO_s_mem());
+    cbio = BIO_new(BIO_s_mem());
+    if (!kbio || !cbio) goto done;
+    if (!PEM_write_bio_PrivateKey(kbio, pkey, NULL, NULL, 0, NULL, NULL)) goto done;
+    if (!PEM_write_bio_X509(cbio, cert)) goto done;
+    klen = BIO_get_mem_data(kbio, &kptr);
+    clen = BIO_get_mem_data(cbio, &cptr);
+    if (klen <= 0 || clen <= 0) goto done;
+    if (!identity_write(LOCKDOWN_KEY, kptr, (size_t)klen, 0600)) goto done;
+    if (!identity_write(LOCKDOWN_CERT, cptr, (size_t)clen, 0644)) goto done;
+    fprintf(stderr, "identity: wrote %s (0600) and %s (0644)\n", LOCKDOWN_KEY, LOCKDOWN_CERT);
+    rc = 1;
+
+done:
+    if (rc != 1) fprintf(stderr, "identity: generation failed\n");
+    if (kbio) BIO_free(kbio);
+    if (cbio) BIO_free(cbio);
+    if (cert) X509_free(cert);
+    if (pkey) EVP_PKEY_free(pkey);
+    if (rsa) RSA_free(rsa);
+    if (e) BN_free(e);
+    return rc;
+}
+
 #define FFS_EP_OUT "/dev/usb-ffs/okcar/ep1"
 #define FFS_EP_IN "/dev/usb-ffs/okcar/ep2"
 
@@ -1146,6 +1250,10 @@ static void handle_setup(int fd, const struct usb_ctrlrequest *r) {
 }
 
 int main(int argc, char **argv) {
+    if (argc > 1 && strcmp(argv[1], "--gen-identity") == 0) {
+        int g = gen_identity(argc > 2 && strcmp(argv[2], "--force") == 0);
+        return g < 0 ? 1 : 0;          /* 0: generated, or a pair was already installed */
+    }
     const char *ep0 = argc > 1 ? argv[1] : "/dev/usb-ffs/okcar/ep0";
     int fd = open(ep0, O_RDWR);
     if (fd < 0) {

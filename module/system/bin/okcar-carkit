@@ -767,14 +767,41 @@ setid() {
 # 有线会话的 TLS 身份。daemon 在 lockdown 的 EnableSessionSSL 里要用
 # /data/local/tmp/lockdown-{cert,key}.pem。那两个文件放在 /data/local/tmp —— 恢复出厂就没了，之后
 # 每一次握手都死在 "tls: handshake r=-1 err=1 ... NO_CERTIFICATE_SET"，而日志里看不出是缺文件
-# （2026-10-18 重置 217 后实测：mux 通了、TLS server ready，然后握手失败）。模块自带一份，start 时补上。
+# （2026-10-18 重置 217 后实测：mux 通了、TLS server ready，然后握手失败）。
+#
+# 所以身份有三个来源，按顺序取：
+#   1. payload/lockdown-*.pem —— 打包者预放的一份（可选，开源仓库里不带私钥）；
+#   2. 已经装在 /data/local/tmp 的那对 —— 有就不动。
+#   3. 都没有时**现场生成**：调用 daemon 自己的 --gen-identity 子命令（BoringSSL，自签名
+#      RSA-2048/CN=iPhone/10 年），不依赖外部 openssl 二进制，干净安装也能直接跑起有线。
+LOCKDOWN_CERT=/data/local/tmp/lockdown-cert.pem
+LOCKDOWN_KEY=/data/local/tmp/lockdown-key.pem
+
+identity_present() { [ -s "$LOCKDOWN_CERT" ] && [ -s "$LOCKDOWN_KEY" ]; }
+
+# $1 = force 时无条件重新生成（面板的"重新生成证书"按钮走这里）。
+identity_ensure() {
+  if [ "${1:-}" != "force" ] && identity_present; then return 0; fi
+  _d=$(daemon_bin)
+  [ -n "$_d" ] || { log "TLS: 找不到 okcar-ffs-usbmux，无法生成证书"; return 1; }
+  if [ "${1:-}" = "force" ]; then
+    _out=$("$_d" --gen-identity --force 2>&1); _rc=$?
+  else
+    _out=$("$_d" --gen-identity 2>&1); _rc=$?
+  fi
+  [ "$_rc" = 0 ] || { log "TLS: 生成证书失败（rc=$_rc）：$_out"; return 1; }
+  case "$_out" in *generating*) log "TLS: 已现场生成自签名身份（CN=iPhone）" ;; esac
+  identity_present || { log "TLS: 生成后仍读不到 $LOCKDOWN_CERT / $LOCKDOWN_KEY"; return 1; }
+  return 0
+}
+
 install_lockdown_identity() {
   for _pair in "lockdown-cert.pem:0644" "lockdown-key.pem:0600"; do
     _f=${_pair%%:*}
     _m=${_pair##*:}
     _src=$MODDIR/payload/$_f
-    [ -f "$_src" ] || { log "TLS: 模块里没有 payload/$_f——有线会在 EnableSessionSSL 阶段失败"; continue; }
     _dst=/data/local/tmp/$_f
+    [ -f "$_src" ] || continue
     cmp -s "$_src" "$_dst" 2>/dev/null && continue
     if cp -f "$_src" "$_dst" 2>/dev/null && chmod "$_m" "$_dst" 2>/dev/null; then
       log "TLS: 已安装 $_f（$_m）"
@@ -782,6 +809,7 @@ install_lockdown_identity() {
       log "TLS: 安装 $_f 失败——有线会在 EnableSessionSSL 阶段失败"
     fi
   done
+  identity_ensure
 }
 
 # 复用框架的 g1 时，id 和字符串都是**框架的**（这台 ROM：18d1:4ee7 + Xiaomi MTP）。把它改成 Apple
