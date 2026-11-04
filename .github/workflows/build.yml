@@ -89,7 +89,8 @@ jobs:
           grep -aq 'com/okcar/link/daemon/LinkDaemon' /tmp/okcar-link.dex \
             || { echo "the dex does not contain LinkDaemon: wrong classpath or sources"; exit 1; }
           sha256sum /tmp/okcar-link.dex build/okcar-uinputd build/okcar-ffs-usbmux
-          sha256sum "$zip" > "$zip.sha256"
+          # basename only, so the downloaded asset verifies with a plain `sha256sum -c`
+          ( cd "$(dirname "$zip")" && sha256sum "$(basename "$zip")" ) > "$zip.sha256"
           cat "$zip.sha256"
 
       - uses: actions/upload-artifact@v4
