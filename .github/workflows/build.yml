@@ -21,7 +21,6 @@ permissions:
 env:
   AOSP_DEPS_TAG: ${{ github.event.inputs.aosp_deps_tag || 'aosp-deps' }}
   BUILD_TOOLS: '34.0.0'
-  PLATFORM: 'android-33'
 
 jobs:
   module:
@@ -35,11 +34,22 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      - name: Android SDK
-        uses: android-actions/setup-android@v3
-
-      - name: Install d8 (build-tools) and android.jar (platform)
-        run: sdkmanager --install "build-tools;$BUILD_TOOLS" "platforms;$PLATFORM"
+      - name: Locate d8 (the runner ships an Android SDK; install build-tools only if it is missing)
+        run: |
+          set -euo pipefail
+          SDK="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
+          find_d8() { ls "$SDK"/build-tools/*/d8 2>/dev/null | sort -V | tail -1; }
+          D8="$(find_d8 || true)"
+          if [ -z "$D8" ]; then
+            SM="$SDK/cmdline-tools/latest/bin/sdkmanager"
+            [ -x "$SM" ] || { echo "no d8 and no sdkmanager under $SDK"; exit 1; }
+            yes | "$SM" --licenses >/dev/null 2>&1 || true
+            "$SM" --install "build-tools;$BUILD_TOOLS" >/dev/null 2>&1 || true
+            D8="$(find_d8 || true)"
+          fi
+          [ -n "$D8" ] || { echo "no d8 available: install build-tools, or add d8.jar to the dependency bundle"; exit 1; }
+          echo "D8=$D8" >> "$GITHUB_ENV"
+          echo "using $D8"
 
       - name: Fetch the AOSP dependency bundle
         env:
@@ -57,9 +67,9 @@ jobs:
           set -euo pipefail
           mkdir -p build
           cp /tmp/deps/prebuilt/okcar-uinputd /tmp/deps/prebuilt/okcar-ffs-usbmux build/
-          export FRAMEWORK_JARS=/tmp/deps/framework-jars
-          export ANDROID_JAR="$ANDROID_SDK_ROOT/platforms/$PLATFORM/android.jar"
-          export D8="$ANDROID_SDK_ROOT/build-tools/$BUILD_TOOLS/d8"
+          export FRAMEWORK_JARS="${FRAMEWORK_JARS:-/tmp/deps/framework-jars}"
+          # android.jar comes from the bundle (a fixed file), so only d8 has to come from the runner.
+          export ANDROID_JAR="$FRAMEWORK_JARS/android.jar"
           export REQUIRE_ARTIFACTS=1
           bash tools/package-module.sh
 
