@@ -273,12 +273,13 @@ splits the work (`.github/workflows/build.yml`):
    with a SHA-256 per file.
 
 *  **CI** downloads that bundle from the release tag (`AOSP_DEPS_TAG`, default `aosp-deps`), checks it with
-   `sha256sum -c`, installs JDK 17 and the SDK (`build-tools`, `platforms;android-33`), and assembles:
+   `sha256sum -c`, sets up JDK 17, takes `d8` from the runner's preinstalled Android SDK (installing `build-tools`
+   only when it is missing), and takes `android.jar` from the bundle itself, so only `d8` depends on the runner:
 
        FRAMEWORK_JARS=/tmp/deps/framework-jars \
-       ANDROID_JAR=$ANDROID_SDK_ROOT/platforms/android-33/android.jar \
-       D8=$ANDROID_SDK_ROOT/build-tools/34.0.0/d8 REQUIRE_ARTIFACTS=1 \
-       bash tools/package-module.sh
+       ANDROID_JAR=/tmp/deps/framework-jars/android.jar \
+       D8=$(ls "$ANDROID_SDK_ROOT"/build-tools/*/d8 | sort -V | tail -1) \
+       REQUIRE_ARTIFACTS=1 bash tools/package-module.sh
 
    So `daemon/src` is compiled by CI on every run — the part worth building in public — while the framework jars and
    the two natives ride along as pinned inputs. `REQUIRE_ARTIFACTS=1` makes the packager fail rather than ship a zip
@@ -287,7 +288,9 @@ splits the work (`.github/workflows/build.yml`):
    release.
 
    The tradeoff is deliberate: the natives CI ships are copied, not rebuilt, so `tools/make-aosp-deps.sh` must be
-   re-run and re-published whenever `native/` changes, or a release carries an older binary than its sources.
+   re-run and re-published whenever `native/` changes, or a release carries an older binary than its sources. The dex
+is recompiled by every run, so its bytes are not identical to a local AOSP-`d8` build; the natives are byte-identical
+to the bundle because they are copied.
 
 Either way the entry points are the same: `TREE=` for a local AOSP checkout (§2.1–§2.5), `FRAMEWORK_JARS=` for the
 bundle above, and one `tools/package-module.sh` for both.
@@ -346,6 +349,9 @@ both native builders.
 *  The CI path was run locally, without an AOSP checkout: `FRAMEWORK_JARS=<bundle>/framework-jars ANDROID_JAR=...
 D8_JAR=... REQUIRE_ARTIFACTS=1 bash tools/package-module.sh` recompiled `daemon/src` against the bundle's framework
 jars and produced the same 36-file zip from the bundle's prebuilt natives.
+*  The workflow itself ran green on GitHub (`workflow_dispatch`, 30 s): it downloaded the published bundle, verified
+its manifest, compiled `daemon/src` with the runner's `d8`, and uploaded a 36-file zip artifact (dex 804,692 B,
+`7c7ac459…` — a different `d8` build than the local one — with both natives byte-identical to the bundle).
 *  A real install ran on a KernelSU device (Android 15, arm64): `ksud module install` accepted the zip, the module came
 back after a reboot as `okcarlink 1.0.0 (100)`, `service.sh` started `app_process64 ... com.okcar.link.daemon.LinkDaemon`
 (recorded in `/data/local/tmp/okcar-linkd.status`), the wired helper bound `/dev/usb-ffs/okcar/ep0`, and the device-side

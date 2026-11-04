@@ -270,13 +270,14 @@ okcar-port-lite,okcarlink}` 以及 `/data/adb/modules_update` 下的相同路径
    该包内含 `framework-jars/`（`framework-minus-apex.jar`、`android.jar`，以及树里存在的 wifi / connectivity /
    graphics / media jar）、`prebuilt/`（第 2.3 节构建出的两个原生）与逐文件 SHA-256 的 `deps-manifest.txt`。
 
-*  **CI** 从该 release tag（`AOSP_DEPS_TAG`，默认 `aosp-deps`）下载这个包，用 `sha256sum -c` 校验，安装 JDK 17
-   与 SDK（`build-tools`、`platforms;android-33`），然后组装：
+*  **CI** 从该 release tag（`AOSP_DEPS_TAG`，默认 `aosp-deps`）下载这个包，用 `sha256sum -c` 校验，装好 JDK 17，
+   `d8` 取自 runner 预装的 Android SDK（仅在缺失时才安装 `build-tools`），`android.jar` 用包自带的那个，
+   所以只有 `d8` 依赖 runner：
 
        FRAMEWORK_JARS=/tmp/deps/framework-jars \
-       ANDROID_JAR=$ANDROID_SDK_ROOT/platforms/android-33/android.jar \
-       D8=$ANDROID_SDK_ROOT/build-tools/34.0.0/d8 REQUIRE_ARTIFACTS=1 \
-       bash tools/package-module.sh
+       ANDROID_JAR=/tmp/deps/framework-jars/android.jar \
+       D8=$(ls "$ANDROID_SDK_ROOT"/build-tools/*/d8 | sort -V | tail -1) \
+       REQUIRE_ARTIFACTS=1 bash tools/package-module.sh
 
    也就是说每次运行都由 CI 编译 `daemon/src`——值得公开构建的那部分——framework jar 与两个原生则作为固定输入
    随行。`REQUIRE_ARTIFACTS=1` 让打包器在缺产物时失败，而不是发一个残缺的 zip。之后任务会校验 zip（两个原生、
@@ -284,7 +285,8 @@ okcar-port-lite,okcarlink}` 以及 `/data/adb/modules_update` 下的相同路径
    `.sha256` 附到 release。
 
    取舍是刻意的：CI 发出的原生是复制而非重建，所以 `native/` 一改就必须重跑并重新发布
-   `tools/make-aosp-deps.sh`，否则 release 里的二进制会比源码旧。
+   `tools/make-aosp-deps.sh`，否则 release 里的二进制会比源码旧。dex 每次都会重新编译，所以它的字节与本地 AOSP
+`d8` 构建并不相同；两个原生因为只是复制，与包内逐字节一致。
 
 两条路入口一致：本地 AOSP 检出用 `TREE=`（第 2.1–2.5 节），上面这个包用 `FRAMEWORK_JARS=`，两者都跑同一个
 `tools/package-module.sh`。
@@ -342,6 +344,9 @@ com.okcar.link.daemon.LinkDaemon`，此前先填好 `app_process` 期望的 `AND
 *  在没有 AOSP 检出的情况下本地跑过 CI 路径：`FRAMEWORK_JARS=<包>/framework-jars ANDROID_JAR=...
    D8_JAR=... REQUIRE_ARTIFACTS=1 bash tools/package-module.sh` 用包里的 framework jar 重新编译了
    `daemon/src`，并用包里预构建的原生产出同一个 36 文件 zip。
+*  这个 workflow 本身在 GitHub 上跑绿了（`workflow_dispatch`，30 秒）：它下载已发布的包、校验清单、用 runner 的
+`d8` 编译 `daemon/src`，上传了 36 文件的 zip 产物（dex 804,692 B、`7c7ac459…`——与本地不同的 `d8` 构建——两个原生
+与包内逐字节一致）。
 *  在 KernelSU 设备（Android 15、arm64）上真实安装过：`ksud module install` 接受该 zip，重启后模块以
    `okcarlink 1.0.0 (100)` 起来，`service.sh` 启动了 `app_process64 ... com.okcar.link.daemon.LinkDaemon`
    （记录在 `/data/local/tmp/okcar-linkd.status`），有线助手绑定了 `/dev/usb-ffs/okcar/ep0`，dex 与两个原生的
