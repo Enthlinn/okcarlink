@@ -28,3 +28,4 @@ tools/lab-patterns.local
 .vscode/
 *.swp
 .DS_Store
+.tmp/

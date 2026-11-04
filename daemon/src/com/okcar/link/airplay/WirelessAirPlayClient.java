@@ -2302,32 +2302,61 @@ public final class WirelessAirPlayClient {
                                     + ") - connecting with the scope only");
                         }
                     }
-                    final long connectStart = System.nanoTime();
+                    long connectStart = System.nanoTime();
                     try {
                         socket.connect(target, CONNECT_TIMEOUT_MS);
                     } catch (java.io.IOException first) {
-                        /* The source-bound connect can be rejected by the local policy
-                         * routing before a single SYN leaves (measured 2026-11-04 on the
-                         * raw NCM gadget: the same kernel accepted an unbound
-                         * `nc fe80::2%usb0 7000` instantly while the source-bound JVM
-                         * dial returned ENETUNREACH ~2 ms in).  The scope on the target is
-                         * what pins the interface, so a connect that dies INSTANTLY with a
-                         * routing error is retried on a fresh socket without the local bind
-                         * before the candidate is given up. */
-                        if (boundLocal && instantUnreach(first, System.nanoTime() - connectStart)) {
+                        /* A connect that dies INSTANTLY with a routing errno was refused
+                         * before a single SYN left: the oif-pinned lookup found no usable
+                         * route at that moment.  The wired host route lives in `main` and
+                         * the gadget's re-enumerations flush it (the keeper re-asserts it
+                         * every 2 s), so the dial can land exactly in a flushed window --
+                         * measured 2026-11-05 00:58: the keeper verified `route get` ->
+                         * usb0 at .097 and the same command answered `dev wlan0` at .179,
+                         * and the scoped connect failed with ENETUNREACH in ~40 ms.
+                         * Re-assert the carrier route in place, wait out the flap, and
+                         * retry on a fresh socket before the candidate is given up. */
+                        java.io.IOException failure = first;
+                        boolean reconnected = false;
+                        for (int round = 0; round < 3; round++) {
+                            if (!instantUnreach(failure, System.nanoTime() - connectStart)) {
+                                break;
+                            }
+                            reassertCarrierRoute(host, mCarrierInterface);
+                            try {
+                                Thread.sleep(400L);
+                            } catch (InterruptedException ie) {
+                                Thread.currentThread().interrupt();
+                                break;
+                            }
                             try {
                                 socket.close();
                             } catch (java.io.IOException ignored) {
                                 /* replaced below */
                             }
                             socket = new Socket();
-                            mState.log("airplay", "  " + host
-                                    + " source-bound connect rejected instantly ("
-                                    + first.getMessage() + ") - retrying with the scope only");
-                            socket.connect(target, CONNECT_TIMEOUT_MS);
-                        } else {
-                            throw first;
+                            final java.net.InetAddress rebound = carrierLocalAddress(target);
+                            if (rebound != null) {
+                                try {
+                                    socket.bind(new java.net.InetSocketAddress(rebound, 0));
+                                } catch (java.net.BindException be) {
+                                    /* the scope on the target pins the interface */
+                                }
+                            }
+                            connectStart = System.nanoTime();
+                            try {
+                                socket.connect(target, CONNECT_TIMEOUT_MS);
+                                reconnected = true;
+                                break;
+                            } catch (java.io.IOException again) {
+                                failure = again;
+                            }
                         }
+                        if (!reconnected) {
+                            throw failure;
+                        }
+                        mState.log("airplay", "  " + host + " recovered after in-dial"
+                                + " route re-assert (" + failure.getMessage() + ")");
                     }
                     socket.setSoTimeout(READ_TIMEOUT_MS);
                     mState.log("airplay", "connected via candidate " + host
@@ -2366,6 +2395,34 @@ public final class WirelessAirPlayClient {
         final String m = String.valueOf(e.getMessage());
         return m.contains("ENETUNREACH") || m.contains("EINVAL")
                 || m.contains("EHOSTUNREACH") || m.contains("ENETDOWN");
+    }
+
+    /**
+     * Re-asserts the wired carrier's host route and its policy rule in the main table.
+     *
+     * <p>The same two `ip` calls the carkit route keeper runs, issued from inside the dial:
+     * when the scoped connect dies instantly with a routing errno the route is usually gone at
+     * that very moment (gadget re-enumeration flushes interface routes), and waiting for the
+     * keeper's next 2 s tick wastes the candidate.  Best effort -- a failure here just leaves
+     * the retry to the next pass over the candidate list.
+     */
+    private static void reassertCarrierRoute(String host, String carrierInterface) {
+        if (carrierInterface == null || carrierInterface.isEmpty() || host.indexOf(':') < 0) {
+            return;
+        }
+        final String bare = host.split("%")[0];
+        try {
+            Runtime.getRuntime().exec(new String[]{"/system/bin/ip", "-6", "route",
+                    "replace", bare + "/128", "dev", carrierInterface, "table", "main"});
+        } catch (Throwable ignored) {
+            /* best effort */
+        }
+        try {
+            Runtime.getRuntime().exec(new String[]{"/system/bin/ip", "-6", "rule",
+                    "add", "to", bare + "/128", "lookup", "main", "pref", "110"});
+        } catch (Throwable ignored) {
+            /* best effort */
+        }
     }
 
     /**
@@ -2875,7 +2932,9 @@ public final class WirelessAirPlayClient {
         } catch (Throwable ignored) {
             /* fall through to the hard-coded candidate */
         }
-        out.add("192.0.2.1");
+        /* Android's standard P2P group-owner address: when the phone joins an accessory-hosted
+         * group but the GO address is not on any interface yet, this is where it will be. */
+        out.add("192.168.49.1");
         return new ArrayList<String>(out);
     }
 
