@@ -1,0 +1,14 @@
+<!doctype html>
+<!-- 面板前门：直接跳到 KernelSU 那套 WebUI（同一份 webroot/，两边界面完全一致）。
+     由 okcar-port-panel 启动的 httpd 文档根就是 webroot，所以正常访问 / 时其实看到的是
+     webroot/index.html；这个页面只在把文档根指到模块目录时（-h <模块目录>）才用到。 -->
+<html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>OkCarLink</title>
+<script>
+  var t = new URLSearchParams(location.search).get('token') || '';
+  location.replace('../webroot/' + (t ? '?token=' + encodeURIComponent(t) : ''));
+</script></head>
+<body style="background:#0f1318;color:#e8eef4;font:15px system-ui;padding:16px">
+正在打开 OkCarLink 控制面板…（若没有自动跳转，请访问 <code>../webroot/</code>）
+</body></html>

@@ -1,0 +1,64 @@
+#!/system/bin/sh
+# 本机控制面板：给没有 WebUI 桥的安装方式（例如 Magisk）一个入口。
+# 用 busybox httpd 起在 127.0.0.1（Magisk 自带 busybox），URL 带随机 token，只对本机开放。
+set -u
+export PATH=/system/bin:/system/xbin:/vendor/bin:/data/adb/magisk:/data/adb/ksu/bin:$PATH
+HERE=$(dirname "$0")
+MODULE=$(cd "$HERE/../.." && pwd)
+WEB="$MODULE/webroot"   # 直接用 KSU 那套页面：两边完全一致
+TMPDIR=${OKCAR_PANEL_TMP:-/data/local/tmp}
+TOKEN_FILE="$TMPDIR/okcar-port-panel.token"
+PID_FILE="$TMPDIR/okcar-port-panel.pid"
+LOG="$TMPDIR/okcar-port-panel.log"
+PORT=${OKCAR_PANEL_PORT:-8088}
+HOST=127.0.0.1
+
+token() {
+  [ -s "$TOKEN_FILE" ] || { head -c 16 /dev/urandom 2>/dev/null | od -An -tx1 | tr -d ' \n' > "$TOKEN_FILE"; }
+  [ -s "$TOKEN_FILE" ] || md5sum /proc/uptime 2>/dev/null | cut -c1-32 > "$TOKEN_FILE"
+  cat "$TOKEN_FILE"
+}
+pid_is_panel() {
+  # /data/local/tmp 里的 pid 会跨重启留存、也可能被复用（实测重启后 status 误报 running），
+  # 所以必须核对 /proc/<pid>/cmdline 是不是我们的 httpd。
+  [ -n "${1:-}" ] || return 1
+  kill -0 "$1" 2>/dev/null || return 1
+  tr '\0' ' ' < "/proc/$1/cmdline" 2>/dev/null | grep -q "httpd .*$PORT"
+}
+
+busybox_bin() {
+  for c in /data/adb/magisk/busybox /data/adb/ksu/bin/busybox busybox; do
+    command -v "$c" >/dev/null 2>&1 && "$c" httpd --help >/dev/null 2>&1 && { echo "$c"; return 0; }
+  done
+  return 1
+}
+case "${1:-status}" in
+  start)
+    bb=$(busybox_bin) || { echo "本机没有带 httpd 的 busybox（KernelSU 请直接用管理器 WebUI）"; exit 3; }
+    # 已经在跑也要把网址打出来（调用方常常按最后一行取网址）
+    if pid_is_panel "$(cat "$PID_FILE" 2>/dev/null)"; then echo "already running pid=$(cat "$PID_FILE")"; sh "$0" url; exit 0; fi
+    # 两点实测结论（2026-10-03，lmi/Magisk + busybox 1.36）：
+    #  · 不加 -f 时 httpd 会 fork 自己，$! 立刻失效，start 会被误判失败 → 必须 -f；
+    #  · 加 -c 配置反而把 CGI 弄坏（/cgi-bin 一律 401）：不加配置时 busybox 按 cgi-bin/
+    #    约定直接执行脚本（实测 200），所以这里就不要再写配置了。
+    # CGI 必须是可执行的，busybox httpd 对不可执行的文件直接 404（实测：zip/manual push 都可能
+    # 变成 0644），所以每次启动都自己校正一次，而不是指望打包或安装过程。
+    chmod 0755 "$WEB/cgi-bin" 2>/dev/null || true
+    [ -f "$WEB/cgi-bin/ctl" ] && chmod 0755 "$WEB/cgi-bin/ctl" 2>/dev/null || true
+    "$bb" httpd -f -p "$HOST:$PORT" -h "$WEB" >> "$LOG" 2>&1 &
+    echo $! > "$PID_FILE"; sleep 1
+    if pid_is_panel "$(cat "$PID_FILE" 2>/dev/null)"; then
+      u=$(sh "$0" url); echo "$u" | tee "$TMPDIR/okcar-port-panel.url"
+      # 通知里放网址：Magisk 的 action 输出只进日志，看不见（实测），通知才能长按复制。
+      cmd notification post -S bigtext -t "OkCarLink 控制面板" okcar-panel "$u" >/dev/null 2>&1
+    else echo "启动失败，见 $LOG"; exit 4; fi ;;
+  stop)
+    [ -s "$PID_FILE" ] && kill "$(cat "$PID_FILE")" 2>/dev/null; rm -f "$PID_FILE"
+    pkill -f "httpd -p $HOST:$PORT" 2>/dev/null; echo stopped ;;
+  status)
+    if pid_is_panel "$(cat "$PID_FILE" 2>/dev/null)"; then echo "running pid=$(cat "$PID_FILE") $(sh "$0" url)"; else echo "not running"; fi ;;
+  url) echo "http://$HOST:$PORT/?token=$(token)" ;;
+  open) u="http://$HOST:$PORT/?token=$(token)"; echo "$u"; am start -a android.intent.action.VIEW -d "$u" >/dev/null 2>&1 ;;
+  conf) echo "$TMPDIR/okcar-port-panel.httpd.conf" ;;
+  *) echo "usage: $0 start|stop|status|url"; exit 2 ;;
+esac

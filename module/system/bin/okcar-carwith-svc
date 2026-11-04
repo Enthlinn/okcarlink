@@ -1,0 +1,213 @@
+#!/system/bin/sh
+# okcar-carwith-svc -- give the okcar-carwith bridge service its own SELinux type (A2).
+#
+#   okcar-carwith-svc setup    map the name -> type and arm the watchdog  (post-fs-data.sh calls this)
+#   okcar-carwith-svc status   explain the current state (labels / mount / policy / servicemanager)
+#   okcar-carwith-svc off      take the mapping away again (umount)
+#   okcar-carwith-svc watchdog internal: keep an eye on servicemanager for one minute after a mount
+#
+# ── why this exists ─────────────────────────────────────────────────────────────────────────────
+# The CarWith component is an ordinary app (untrusted_app_32 on 217) and finds the root daemon with
+# ServiceManager.getService("okcar-carwith").  servicemanager resolves a service NAME to a type from
+# /system/etc/selinux/plat_service_contexts; a name that is not listed there falls back to
+# default_android_service, which no app may find, so the lookup came back null and every CarWith step
+# after it (prepareCast / displayId / key / touch / audio) never ran:
+#
+#   avc: denied { find } for pid=17281 uid=10317 name=okcar-carwith
+#     scontext=u:r:untrusted_app_32:s0 tcontext=u:object_r:default_android_service:s0
+#     tclass=service_manager permissive=0        (217, 2026-10-07)
+#
+# The mapping must come from that file, and servicemanager reads it at `on init`, long before /data
+# is mounted — so a module overlay (system/etc/selinux/...) would be far too late even if this
+# device mounted modules at all (it does not: no metamodule, /system/bin/okcar-linkd does not exist
+# and service.sh falls back to /data/adb/modules).  What works, measured on 217 on 2026-10-08:
+#
+#   1. copy the *live* plat_service_contexts (never a shipped copy — a ROM update must not be able to
+#      leave a stale one behind) and append one line mapping our name to our type;
+#   2. relabel the copy u:object_r:service_contexts_file:s0 and bind-mount it over the original.  The
+#      relabel is not cosmetic: a bind mount exposes the *source inode*, files under /data/local/tmp
+#      are shell_data_file, and servicemanager has no read permission for that (checked in
+#      /system/etc/selinux/plat_sepolicy.cil: no allow rule).  Mounting an unreadable file made
+#      servicemanager abort as soon as it re-read the file and took the whole system down twice
+#      before the label was found to be the cause;
+#   3. load the policy once more.  servicemanager caches the parsed file and only re-opens it when
+#      the SELinux policy has been reloaded (frameworks/native/cmds/servicemanager/Access.cpp:
+#      getSehandle() + selinux_status_updated()) — that reload is what makes the mapping visible
+#      without restarting servicemanager;
+#   4. keep a watchdog for a minute: if servicemanager stops answering, the mapping is taken away
+#      again, so even a wrong guess here costs a second of service restarts instead of a hang.
+#
+# The type itself is declared by the module's sepolicy.rule.  Nothing is mounted unless the type is
+# really in the loaded policy: a file naming an unknown type would make every lookup of that one name
+# fail (instead of falling back) and that is worse than no mapping at all.
+#
+# Rollback: `okcar-carwith-svc off` (or just reboot — the mount does not survive one).
+
+SVC=okcar-carwith
+TYPE=okcar_carwith_service
+SRC=/system/etc/selinux/plat_service_contexts
+COPY=/data/local/tmp/okcar-plat-service-contexts
+LABEL=u:object_r:service_contexts_file:s0
+LOG=/data/local/tmp/okcar-port.log
+
+# A shell started as `sh <script>` on this ROM comes up with PATH=/vendor/bin:/vendor/xbin only
+# (measured 2026-10-08 — mksh is not the login shell there), so mount/chcon/stat/pidof would all be
+# "inaccessible or not found" and the mapping would silently never be made.  Same fix as okcar-linkd.
+case ":$PATH:" in
+  *:/system/bin:*) ;;
+  *) PATH="/system/bin:/system/xbin:/vendor/bin${PATH:+:$PATH}" ;;
+esac
+export PATH
+
+# Module root: this helper lives in <mod>/system/bin, but it may also be started through a mounted
+# /system/bin.  Same fallback list as okcar-linkd.
+MODDIR=$(cd "${0%/*}/../.." 2>/dev/null && pwd)
+if [ -z "$MODDIR" ] || [ ! -f "$MODDIR/sepolicy.rule" ]; then
+  for _c in /data/adb/modules/okcar-port /data/adb/modules/okcar-port-lite \
+            /data/adb/modules_update/okcar-port /data/adb/modules_update/okcar-port-lite \
+            /data/adb/ksu/modules/okcar-port /data/adb/ksu/modules/okcar-port-lite \
+            /data/adb/modules/okcarlink /data/adb/ksu/modules/okcarlink; do
+    if [ -f "$_c/sepolicy.rule" ]; then MODDIR=$_c; break; fi
+  done
+fi
+RULE=$MODDIR/sepolicy.rule
+
+log() { echo "$(date '+%F %T') carwith-svc: $*" >> "$LOG" 2>/dev/null; }
+
+# Load the module's rule file with whichever root solution is installed.  Both commands end in a
+# policy load, which is also the signal servicemanager waits for before re-reading the file.
+policy_apply() {
+  if [ -x /data/adb/ksu/bin/ksud ]; then
+    /data/adb/ksu/bin/ksud sepolicy apply "$RULE" >> "$LOG" 2>&1
+    return $?
+  fi
+  _mp=$(command -v magiskpolicy 2>/dev/null)
+  [ -n "$_mp" ] || { [ -x /data/adb/magisk/magiskpolicy ] && _mp=/data/adb/magisk/magiskpolicy; }
+  [ -n "$_mp" ] || return 1
+  "$_mp" --live --apply "$RULE" >> "$LOG" 2>&1
+}
+
+mounted() { grep -q " $SRC " /proc/self/mountinfo 2>/dev/null; }
+
+# "<pid> <starttime>" of servicemanager, or nothing when it is not running.  The start time is what
+# makes this a real identity: /proc/<pid>/stat field 22 never repeats for a recycled pid.
+sm_state() {
+  _p=$(pidof servicemanager 2>/dev/null | awk '{print $1}')
+  [ -n "$_p" ] || return 1
+  _st=$(awk '{print $22}' "/proc/$_p/stat" 2>/dev/null)
+  [ -n "$_st" ] || return 1
+  printf '%s %s' "$_p" "$_st"
+}
+
+# servicemanager is alive *and the same process* across a 6 s window.  A process that is crash
+# looping (which is what a mapping it cannot read used to cause) fails this on the first try, while a
+# merely busy one does not.  The CLI is only used as an extra signal when it is actually on PATH —
+# an earlier version treated "service: not found" as "servicemanager is dead" and unmounted a
+# perfectly good mapping.
+healthy() {
+  _a=$(sm_state) || return 1
+  sleep 6
+  _b=$(sm_state) || return 1
+  [ "$_a" = "$_b" ] || return 1
+  if command -v service >/dev/null 2>&1; then
+    service list >/dev/null 2>&1 || return 1
+  fi
+  return 0
+}
+
+watchdog() {
+  _i=0
+  while [ "$_i" -lt 8 ]; do
+    if ! healthy; then
+      umount "$SRC" 2>/dev/null
+      log "watchdog: servicemanager is not the same live process anymore after the mapping was mounted — unmounted it again"
+      return 0
+    fi
+    sleep 6
+    _i=$((_i + 1))
+  done
+  log "watchdog: servicemanager stable for ~100s with the mapping in place"
+}
+
+setup() {
+  [ -r "$SRC" ] || { log "no $SRC on this ROM — nothing to map"; return 0; }
+  if mounted; then
+    log "$SRC already carries a mapping"
+  fi
+  if [ ! -f "$COPY" ] || ! mounted; then
+    if ! grep -qa "$TYPE" /sys/fs/selinux/policy 2>/dev/null; then
+      policy_apply
+      if ! grep -qa "$TYPE" /sys/fs/selinux/policy 2>/dev/null; then
+        log "type $TYPE is not in the loaded policy (sepolicy.rule not applied?) — not mounting"
+        return 0
+      fi
+    fi
+    cat "$SRC" > "$COPY" 2>/dev/null || { log "cannot write $COPY"; return 0; }
+    printf '%s u:object_r:%s:s0\n' "$SVC" "$TYPE" >> "$COPY" 2>/dev/null
+    _want=$(( $(wc -l < "$SRC") + 1 ))
+    _got=$(wc -l < "$COPY")
+    if [ "$_got" -ne "$_want" ]; then
+      log "copy has $_got lines, expected $_want — not mounting"
+      return 0
+    fi
+    chmod 0644 "$COPY" 2>/dev/null
+    chcon "$LABEL" "$COPY" 2>/dev/null
+    _lbl=$(stat -c '%C' "$COPY" 2>/dev/null | head -n 1)
+    if [ "$_lbl" != "$LABEL" ]; then
+      log "copy is labelled '$_lbl', not '$LABEL' — not mounting (servicemanager could not read it)"
+      return 0
+    fi
+    if ! mounted; then
+      if mount --bind "$COPY" "$SRC" 2>>"$LOG"; then
+        log "mounted the mapping over $SRC"
+      else
+        log "bind mount over $SRC failed — the app will not find the bridge"
+        return 0
+      fi
+    fi
+  fi
+  _lbl=$(stat -c '%C' "$SRC" 2>/dev/null | head -n 1)
+  if [ "$_lbl" != "$LABEL" ]; then
+    log "$SRC is now labelled '$_lbl' — taking the mount away again"
+    umount "$SRC" 2>/dev/null
+    return 0
+  fi
+  if policy_apply; then
+    log "policy reloaded — servicemanager will re-read the file"
+  else
+    log "no sepolicy tool found — servicemanager keeps the old mapping"
+    return 0
+  fi
+  # Detached, so it also outlives this script when post-fs-data.sh calls it at boot.
+  if command -v setsid >/dev/null 2>&1; then
+    setsid "$0" watchdog >> "$LOG" 2>&1 &
+  else
+    "$0" watchdog >> "$LOG" 2>&1 &
+  fi
+  return 0
+}
+
+status() {
+  echo "service_contexts: $SRC"
+  echo "  mounted: $(mounted && echo yes || echo no)"
+  echo "  label:   $(stat -c '%C' "$SRC" 2>/dev/null | head -n 1)"
+  echo "  mapped:  $(grep -c "^$SVC " "$SRC" 2>/dev/null)"
+  echo "  copy:    $COPY label=$(stat -c '%C' "$COPY" 2>/dev/null | head -n 1) lines=$(wc -l < "$COPY" 2>/dev/null)"
+  echo "policy type $TYPE: $(grep -qa "$TYPE" /sys/fs/selinux/policy 2>/dev/null && echo present || echo absent)"
+  echo "servicemanager: $(sm_state 2>/dev/null) healthy=$(healthy && echo yes || echo no)"
+  if command -v service >/dev/null 2>&1; then
+    # service list prints "<index>\t<name>: [<interface>]" — anchor on the name, not on the line.
+    echo "registered: $(service list 2>/dev/null | grep -c "[[:space:]]$SVC:") entry for $SVC"
+  else
+    echo "registered: (no service CLI on PATH)"
+  fi
+  echo "module rule: $RULE $( [ -f "$RULE" ] && echo present || echo missing)"
+}
+
+case "${1:-setup}" in
+  setup) setup ;;
+  watchdog) watchdog ;;
+  status) status ;;
+  off) umount "$SRC" 2>/dev/null; log "mapping taken away ($?)"; status ;;
+  *) echo "usage: ${0##*/} setup|status|off" >&2; exit 2 ;;
+esac

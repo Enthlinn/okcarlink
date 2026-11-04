@@ -1,0 +1,92 @@
+#!/system/bin/sh
+# okcar-role -- 钉住本机的 USB 角色：优先 /sys/class/typec/port0/data_role（真的推得动 TCPM），
+# 回退主线 usb_role_switch 的 /sys/class/usb_role/*/role（只在没有 typec 节点的机器上有效）。
+# 这是厂商内核 /dev/okcar 字符设备（"usbmode,1,N"）的标准替代：在已解锁 + KernelSU 的机器上
+# 不需要任何厂商驱动。
+#
+# 为什么是循环保活而不是写一次：两台安卓手机用 C-to-C 线相连时，Type-C 的 CC 协商会反复翻转两端，
+# 而 Android 自己的 USB 栈会在我们写下的角色刚被丢掉的一瞬间重新断言一个角色（configfs 于是显示
+# udc=[]，FunctionFS 也永远收不到 enable 事件，表现就是有线会话静默地起不来）。只写一次不够，
+# 必须把角色一直钉住。
+#
+#   okcar-role start device|host   钉住该角色（1 Hz），直到 `stop`
+#   okcar-role stop                停止钉住（角色维持现状，由 Android 收回）
+#   okcar-role status              节点、当前值与钉住进程 pid
+#
+# 2026-10-25 现场（217 / OkCarOS）：写 /sys/class/usb_role/*/role **完全没有效果**——那只是
+# TCPM 的状态回显，不是控制点；只有 /sys/class/typec/port0/data_role 写下去才会真正把口切成
+# device（数据和电源角色都变、UDC 立刻 configured）。两台机器的节点都在，所以按 typec 优先、
+# usb_role 兜底来找；两者值域同为 device|host，下面的 loop 不用改。
+#
+# 可覆盖：OKCAR_ROLE_NODE（指定节点）与 OKCAR_ROLE_TMP（状态/日志目录），供测试或节点不在
+# 这两处的板子使用。
+set -u
+TMP=${OKCAR_ROLE_TMP:-/data/local/tmp}
+PIDF=$TMP/okcar-role.pid
+LOG=$TMP/okcar-role.log
+WANTF=$TMP/okcar-role.want
+NODE=${OKCAR_ROLE_NODE:-}
+
+log() { echo "$(date '+%F %T') $*" >> "$LOG"; }
+
+# 回读里的方括号才是**当前角色**，位置还不固定：217 实测 data_role -> `host [device]`、
+# power_role -> `[source] sink`（同一时刻 dumpsys usb 的 port_manager.status 也报 device/source，
+# Android 的 UsbPort 同样是只认方括号）。这个循环 1 Hz 一拍，拿整串比就会"永远不相等"->
+# 每秒白写一次 TCPM；status 也会把 `host [device]` 当成当前值报出去。
+role_current() {
+  _rlc=$1
+  case "$_rlc" in
+    *\[*\]*) _rlc=${_rlc#*\[}; _rlc=${_rlc%%\]*} ;;
+    *) _rlc=$(printf '%s' "$_rlc" | tr -d '[:space:]') ;;
+  esac
+  printf '%s\n' "$_rlc"
+}
+
+find_node() {
+  if [ -n "$NODE" ] && [ -e "$NODE" ]; then return 0; fi
+  if [ -e /sys/class/typec/port0/data_role ]; then NODE=/sys/class/typec/port0/data_role; return 0; fi
+  for _n in /sys/class/usb_role/*/role; do
+    [ -e "$_n" ] && { NODE=$_n; return 0; }
+  done
+  return 1
+}
+
+case "${1:-status}" in
+  start)
+    want=${2:-}
+    case "$want" in
+      device|host) ;;
+      *) echo "用法：$0 start device|host"; exit 2 ;;
+    esac
+    find_node || { echo "找不到 USB 角色节点（/sys/class/typec/port0/data_role 与 /sys/class/usb_role/*/role 都没有）——这台机器无法用软件切换角色（可设 OKCAR_ROLE_NODE=<path>）"; exit 1; }
+    [ -f "$PIDF" ] && kill "$(cat "$PIDF")" 2>/dev/null
+    printf %s "$want" > "$WANTF"
+    OKCAR_ROLE_NODE=$NODE OKCAR_ROLE_TMP=$TMP nohup sh "$0" loop >/dev/null 2>&1 </dev/null &
+    echo $! > "$PIDF"
+    log "钉住 $want 于 $NODE（pid $(cat "$PIDF")）"
+    echo "角色钉住：$want 于 $NODE（pid $(cat "$PIDF")）"
+    ;;
+  loop)
+    want=$(cat "$WANTF" 2>/dev/null)
+    [ -n "$want" ] || want=device
+    while :; do
+      [ -f "$WANTF" ] || break
+      [ "$(role_current "$(cat "$NODE" 2>/dev/null)")" != "$want" ] && echo "$want" > "$NODE" 2>/dev/null
+      sleep 1
+    done
+    ;;
+  stop)
+    [ -f "$PIDF" ] && kill "$(cat "$PIDF")" 2>/dev/null
+    rm -f "$PIDF" "$WANTF"
+    log "已停止钉住"
+    echo "角色钉住已停止"
+    ;;
+  status)
+    if find_node; then
+      echo "node=$NODE current=$(role_current "$(cat "$NODE" 2>/dev/null)") want=$(cat "$WANTF" 2>/dev/null || echo -) pid=$(cat "$PIDF" 2>/dev/null || echo -)"
+    else
+      echo "node=<none>（这台机器上没有 /sys/class/usb_role/*/role）"
+    fi
+    ;;
+  *) echo "用法：$0 {start device|host|stop|status}"; exit 2 ;;
+esac

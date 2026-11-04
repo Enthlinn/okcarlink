@@ -1,0 +1,171 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="auto">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>OkCarLink</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header>
+  <!-- Title only: the old page had a paragraph of explanation under it, which is gone. The three
+       mode choices below are the explanation. -->
+  <div class="titlebar">
+    <h1>OkCarLink</h1>
+    <span id="variant" class="pill hidden" data-en="Lite" data-zh="精简版">Lite</span>
+    <!-- 语言选择器：标题栏右上角。默认中文；选择记在
+         /data/local/tmp/okcar-port-lang，刷新与重启后依然生效。
+         语言名各自用自己的文字写（中文/English），不参与翻译。 -->
+    <label class="lang"><span data-en="Language" data-zh="语言">Language</span>
+      <select id="lang">
+        <option value="zh">中文</option>
+        <option value="en">English</option>
+      </select>
+    </label>
+  </div>
+
+  <!-- 投屏模式：总有一个选中并高亮。紫优的carplay++ 要装了它自己的模块才可用
+       （app.js 看 /data/adb/modules/okcar-carplaypp）；carwith投屏 要机器上有 CarWith
+       （/product/app/CarWith 或 pm path com.miui.carlink）才可用。 -->
+  <div id="modes" class="modes" role="tablist">
+    <button class="mode" data-mode="mirror" role="tab" data-en="Mirror cast" data-zh="镜像投屏">Mirror cast</button>
+    <button class="mode" data-mode="app" role="tab" data-en="App cast" data-zh="应用投屏">App cast</button>
+    <button class="mode" data-mode="carplaypp" id="mode-carpp" role="tab" disabled data-en="Zuiyou carplay++" data-zh="紫优的carplay++">Zuiyou carplay++</button>
+    <button class="mode" data-mode="carwith" id="mode-carwith" role="tab" disabled data-en="CarWith cast" data-zh="carwith投屏">CarWith cast</button>
+  </div>
+
+  <!-- 总状态行（放大、带总开关）与投屏状态行；两者由 5 秒自检刷新。 -->
+  <!-- 两行状态用与下面分类行完全相同的 .cats/.cat 结构：宽度、对齐、开关列都由结构决定，
+       不靠任何像素计算。 -->
+  <div id="status-cats" class="cats"></div>
+</header>
+
+<p id="env" class="banner hidden"></p>
+
+<!-- One capability, one row: live state + its switch. Only 运行中 is shown while healthy; click the
+     row (not the switch) to open its detail panel with the raw values and restart/stop. -->
+<section id="sec-cats">
+  <h2><span data-en="Categories" data-zh="分类状态">分类状态</span><span class="hint" data-en="Tap a row for details and restart/stop" data-zh="点一行进去看具体状态与重启/停止">点一行进去看具体状态与重启/停止</span></h2>
+  <div id="cats" class="cats"></div>
+  <!-- 二级内容各占一个独立页面，点行进入，页面内有返回。 -->
+  <div id="cat-page" class="cat-page"></div>
+  <div id="cat-detail" class="detail hidden"></div>
+</section>
+
+<!-- Its own area, per the requirement: pick the app, then (only then) its activity. -->
+<section id="sec-apps">
+  <h2><span data-en="Cast app selection" data-zh="投屏应用选择">投屏应用选择</span></h2>
+  <!-- 应用与 Activity 各占一行（等宽）。原厂 select 不自带搜索，所以自己做一个：点开面板，
+       面板里有搜索框 + 过滤后的列表；隐藏的原生 select 继续给既有代码读值。 -->
+  <div class="row field-row">
+    <div class="field">
+      <span class="field-label" data-en="App" data-zh="应用">应用</span>
+      <div class="picker" id="picker-app">
+        <button type="button" class="picker-btn" id="picker-app-btn" data-en="(tap to choose an app)" data-zh="（点这里选择应用）">（点这里选择应用）</button>
+        <div class="picker-panel hidden" id="picker-app-panel">
+          <input type="search" id="picker-app-search" placeholder="搜索应用…" data-en-placeholder="Search apps…" data-zh-placeholder="搜索应用…" autocomplete="off">
+          <div class="picker-list" id="picker-app-list"></div>
+        </div>
+      </div>
+      <select id="pick-pkg" class="hidden-select"></select>
+    </div>
+  </div>
+  <div class="row field-row">
+    <div class="field hidden" id="field-activity">
+      <span class="field-label" data-en="Activity" data-zh="Activity">Activity</span>
+      <div class="picker" id="picker-act">
+        <button type="button" class="picker-btn" id="picker-act-btn" data-en="(tap to choose an activity)" data-zh="（点这里选择 activity）">（点这里选择 activity）</button>
+        <div class="picker-panel hidden" id="picker-act-panel">
+          <input type="search" id="picker-act-search" placeholder="搜索 activity…" data-en-placeholder="Search activities…" data-zh-placeholder="搜索 activity…" autocomplete="off">
+          <div class="picker-list" id="picker-act-list"></div>
+        </div>
+      </div>
+      <select id="pick-activity" class="hidden-select"></select>
+    </div>
+  </div>
+  <div class="row">
+    <button id="btn-apply-app" class="primary" data-en="Apply app + activity" data-zh="应用这两个项">应用这两个项</button>
+    <button id="btn-refresh-apps" data-en="Refresh app list" data-zh="刷新应用列表">刷新应用列表</button>
+    <button id="btn-enable" class="primary" data-en="One-key start" data-zh="一键启动">一键启动</button>
+  </div>
+  <p class="hint" id="app-note"></p>
+
+  <h2><span data-en="Bitrate &amp; frame rate" data-zh="码率与帧率">码率与帧率</span></h2>
+  <!-- 无线与有线分开：无线链路承受能力低、有线高得多。滑条与手动输入双向同步；
+       0 表示不覆盖（用与车机协商的值），恢复自动按钮会把四个值都置 0。
+       滑条也从 0 起：否则"自动"会被画在下限上，看着像设了 1000kbps，而数字框里是 0。 -->
+  <div class="row qos-row">
+    <span class="qos-label" data-en="Wireless bitrate" data-zh="无线码率">无线码率</span>
+    <input type="range" id="qos-wl-br-range" min="0" max="30000" step="500">
+    <input type="number" id="qos-wl-br-num" min="0" max="30000" step="500">
+    <span class="qos-unit">kbps</span>
+  </div>
+  <div class="row qos-row">
+    <span class="qos-label" data-en="Wireless frame rate" data-zh="无线帧率">无线帧率</span>
+    <input type="range" id="qos-wl-fps-range" min="0" max="60" step="1">
+    <input type="number" id="qos-wl-fps-num" min="0" max="60" step="1">
+    <span class="qos-unit">fps</span>
+  </div>
+  <div class="row qos-row">
+    <span class="qos-label" data-en="Wired bitrate" data-zh="有线码率">有线码率</span>
+    <input type="range" id="qos-usb-br-range" min="0" max="100000" step="1000">
+    <input type="number" id="qos-usb-br-num" min="0" max="100000" step="1000">
+    <span class="qos-unit">kbps</span>
+  </div>
+  <div class="row qos-row">
+    <span class="qos-label" data-en="Wired frame rate" data-zh="有线帧率">有线帧率</span>
+    <input type="range" id="qos-usb-fps-range" min="0" max="60" step="1">
+    <input type="number" id="qos-usb-fps-num" min="0" max="60" step="1">
+    <span class="qos-unit">fps</span>
+  </div>
+  <div class="row qos-row">
+    <span class="qos-label" data-en="A/V buffer" data-zh="音画缓冲">音画缓冲</span>
+    <input type="range" id="qos-delay-range" min="0" max="2000" step="10">
+    <input type="number" id="qos-delay-num" min="0" max="2000" step="10">
+    <span class="qos-unit">ms</span>
+  </div>
+  <div class="row qos-row">
+    <span class="qos-label" data-en="App render scale" data-zh="应用渲染比例">应用渲染比例</span>
+    <input type="range" id="qos-scale-range" min="25" max="100" step="5">
+    <input type="number" id="qos-scale-num" min="25" max="100" step="5">
+    <span class="qos-unit">%</span>
+  </div>
+  <div class="row">
+    <button id="btn-save-qos" class="primary" data-en="Save bitrate &amp; frame rate" data-zh="保存码率与帧率">保存码率与帧率</button>
+    <button id="btn-reset-qos" data-en="Reset to auto" data-zh="恢复自动">恢复自动</button>
+  </div>
+  <p class="hint" id="qos-note"></p>
+  <p class="hint"><span data-en="App render scale: " data-zh="应用渲染比例：">应用渲染比例：</span><b>100%</b><span data-en=" = build the virtual display at the resolution the head unit declares (the default, best picture); lowering it (e.g. 80%/67%/50%) renders the app at a smaller size and lets the head unit upscale it, which eases the frame spike when opening an app." data-zh=" = 按车机声明的分辨率建虚拟屏（默认，显示效果最好）；调小（如 80%/67%/50%）会让应用按小屏渲染再被车机放大，能减轻手机上开应用时的画面尖峰。"> = 按车机声明的分辨率建虚拟屏（默认，显示效果最好）；调小（如 80%/67%/50%）会让应用按小屏渲染再被车机放大，能减轻手机上开应用时的画面尖峰。</span></p>
+</section>
+
+<section id="sec-prio">
+  <h3><span data-en="App priority" data-zh="应用优先级">应用优先级</span></h3>
+  <p class="hint"><span data-en="One package name per line (text after " data-zh="一行一个包名（">一行一个包名（</span><code>#</code><span data-en=" is a comment). Apps listed here get a raised scheduling priority (nice=-10 and membership of top-app), so opening another app on the phone does not push the casting player aside. Empty = raise nothing; a process restart raises them again automatically." data-zh=" 后为注释）。列在这里的应用会被拔高调度优先级（nice=-10 并加入 top-app），用来避免手机上开别的应用时把投屏中的播放器挤开。留空 = 不拔高任何应用；进程重启会自动重新拔高。"> 后为注释）。列在这里的应用会被拔高调度优先级（nice=-10 并加入 top-app），用来避免手机上开别的应用时把投屏中的播放器挤开。留空 = 不拔高任何应用；进程重启会自动重新拔高。</span></p>
+  <textarea id="prio-list" rows="5" spellcheck="false" placeholder="live.alist.mpv"></textarea>
+  <div class="row">
+    <button id="btn-save-prio" class="primary" data-en="Save priority list" data-zh="保存优先级列表">保存优先级列表</button>
+    <button id="btn-reload-prio" data-en="Reload" data-zh="重新读取">重新读取</button>
+  </div>
+  <p class="hint" id="prio-note"></p>
+</section>
+
+<section id="sec-log">
+  <h2><span data-en="Output" data-zh="输出">输出</span><span class="hint" data-en="Every command echo lands here" data-zh="命令回显都在这里">命令回显都在这里</span></h2>
+  <div class="row"><button id="btn-clear" data-en="Clear" data-zh="清屏">清屏</button><button id="btn-select-all" data-en="Select all" data-zh="全选日志文字">全选日志文字</button><button id="btn-export-out" data-en="Export to file" data-zh="导出到文件">导出到文件</button></div>
+  <textarea id="out" rows="12" data-en="(results appear here)" data-zh="（操作结果会显示在这里）">（操作结果会显示在这里）</textarea>
+</section>
+
+<!-- Bottom of the page, as asked. 跟随系统 is the default. -->
+<section id="sec-theme">
+  <h2><span data-en="Display mode" data-zh="显示模式">显示模式</span></h2>
+  <div class="seg" id="theme-seg">
+    <button class="seg-item" data-theme="auto" data-en="Follow system" data-zh="跟随系统">跟随系统</button>
+    <button class="seg-item" data-theme="day" data-en="Day" data-zh="白天">白天</button>
+    <button class="seg-item" data-theme="night" data-en="Night" data-zh="黑夜">黑夜</button>
+  </div>
+</section>
+
+<script src="ksu-bridge.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

@@ -1,0 +1,364 @@
+/*
+ * OkCarLink module WebUI styles.
+ *
+ * Two palettes, switched by data-theme on <html> (app.js resolves 跟随系统 into one of them).
+ * The rule from the old page is kept: a row is one capability, so its live value and its switch sit
+ * on the same line — a status table at the top with the switches far below made nothing readable
+ * against the control it belonged to.
+ */
+
+:root,
+[data-theme="night"] {
+  color-scheme: dark;
+  --bg: #0f1317;
+  --panel: #171d23;
+  --panel2: #141a20;
+  --line: #26313a;
+  --text: #e6edf3;
+  --dim: #9aa7b4;
+  --accent: #4aa8ff;
+  --ok: #35d07f;
+  --bad: #ff6b6b;
+  --warn: #ffd479;
+  --input: #0f141a;
+}
+
+[data-theme="day"] {
+  color-scheme: light;
+  --bg: #f2f4f7;
+  --panel: #ffffff;
+  --panel2: #f7f9fc;
+  --line: #d5dce4;
+  --text: #16202a;
+  --dim: #5c6b7a;
+  --accent: #0f6fd6;
+  --ok: #0a8f4d;
+  --bad: #c62828;
+  --warn: #8a6100;
+  --input: #ffffff;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  padding: 16px;
+  background: var(--bg);
+  color: var(--text);
+  font: 14px/1.5 system-ui, -apple-system, "Noto Sans CJK SC", sans-serif;
+}
+
+.titlebar { display: flex; align-items: center; gap: 10px; }
+/* 语言选择器固定在标题栏右上角。 */
+.titlebar .lang { margin-left: auto; display: inline-flex; align-items: center; gap: 6px;
+  font-size: 12px; opacity: .85; }
+.titlebar .lang select { background: transparent; color: inherit; border: 1px solid currentColor;
+  border-radius: 6px; padding: 2px 6px; font: inherit; font-size: 12px; }
+.titlebar h1 { margin: 0; font-size: 22px; letter-spacing: 0.5px; }
+.pill {
+  padding: 2px 8px;
+  border: 1px solid var(--accent);
+  border-radius: 999px;
+  color: var(--accent);
+  font-size: 11px;
+}
+
+/* ---------------------------------------------------------------- mode select */
+.modes {
+  display: flex;
+  gap: 8px;
+  margin: 12px 0 14px;
+}
+.mode {
+  flex: 1 1 0;
+  padding: 12px 6px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--panel);
+  color: var(--dim);
+  font: inherit;
+  font-weight: 600;
+  text-align: center;
+}
+.mode:disabled { opacity: 0.4; }
+.mode.active {
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 22%, var(--panel));
+  color: var(--text);
+  box-shadow: inset 0 0 0 1px var(--accent);
+}
+
+/* ---------------------------------------------------------------- status lines */
+.line {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 7px 10px;
+  margin-bottom: 4px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel);
+}
+.line .k { color: var(--dim); }
+.line .v { font-weight: 700; }
+.v.ok { color: var(--ok); }
+.v.bad { color: var(--bad); }
+.v.warn { color: var(--warn); }
+.v.dim { color: var(--dim); font-weight: 400; }
+
+.banner {
+  padding: 10px 12px;
+  margin: 10px 0;
+  border: 1px solid var(--warn);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--warn) 14%, var(--panel));
+  color: var(--warn);
+}
+.hidden { display: none !important; }
+
+section {
+  margin-bottom: 18px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--panel);
+}
+h2 {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  margin: 0 0 10px;
+  font-size: 15px;
+}
+.hint { color: var(--dim); font-size: 12px; font-weight: 400; }
+
+.row { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 8px; }
+
+button {
+  padding: 8px 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel2);
+  color: var(--text);
+  font: inherit;
+}
+button:hover { border-color: var(--accent); }
+button:disabled { opacity: 0.5; }
+button.primary { border-color: var(--accent); font-weight: 600; }
+button.danger { border-color: var(--bad); color: var(--bad); }
+
+input[type="text"], select {
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--input);
+  color: var(--text);
+  font: inherit;
+}
+.field { display: flex; align-items: center; gap: 6px; flex: 1 1 220px; }
+.field-label { color: var(--dim); font-size: 12px; white-space: nowrap; }
+.field select { flex: 1 1 auto; min-width: 0; }
+
+/* ---------------------------------------------------------------- category rows */
+.cats { border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+.cat {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 9px 10px;
+  border-bottom: 1px solid var(--line);
+  background: var(--panel2);
+}
+.cat:last-child { border-bottom: 0; }
+.cat .cat-main {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  flex: 1 1 auto;
+  min-width: 0;
+  cursor: pointer;
+}
+.cat .cat-name { font-weight: 600; white-space: nowrap; }
+.cat .cat-val { font-size: 12px; word-break: break-all; }
+.cat .cat-val.ok { color: var(--ok); font-weight: 700; }
+.cat .cat-val.bad { color: var(--bad); }
+.cat .cat-val.warn { color: var(--warn); }
+.cat .chev { color: var(--dim); font-size: 12px; }
+.cat.open { box-shadow: inset 3px 0 0 var(--accent); }
+
+/* Toggle switch: the only switch shape in this page (left/right sliding). */
+.sw { position: relative; display: inline-block; width: 46px; height: 26px; flex: 0 0 auto; }
+.sw input { position: absolute; opacity: 0; width: 0; height: 0; }
+.sw .track {
+  position: absolute;
+  inset: 0;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--dim) 45%, transparent);
+  transition: background 0.15s;
+}
+.sw .knob {
+  position: absolute;
+  top: 3px;
+  left: 3px;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  background: #fff;
+  transition: transform 0.15s;
+}
+.sw input:checked + .track { background: var(--ok); }
+.sw input:checked + .track .knob { transform: translateX(20px); }
+.sw input:disabled + .track { opacity: 0.5; }
+.sw-label { color: var(--dim); font-size: 12px; white-space: nowrap; }
+
+.detail {
+  margin-top: 10px;
+  padding: 10px;
+  border: 1px solid var(--accent);
+  border-radius: 8px;
+  background: var(--panel2);
+}
+.detail h3 { margin: 0 0 8px; font-size: 14px; }
+.detail .raw {
+  margin: 0 0 10px;
+  padding: 8px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--input);
+  color: var(--text);
+  font: 12px/1.45 ui-monospace, Menlo, monospace;
+  white-space: pre-wrap;
+  word-break: break-all;
+  max-height: 30vh;
+  overflow: auto;
+}
+.detail .warnbox {
+  margin: 0 0 10px;
+  padding: 8px 10px;
+  border: 1px solid var(--warn);
+  border-radius: 6px;
+  color: var(--warn);
+  font-size: 12px;
+}
+
+/* ---------------------------------------------------------------- theme segment */
+.seg { display: flex; gap: 8px; }
+.seg-item {
+  flex: 1 1 0;
+  padding: 10px 6px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel2);
+  color: var(--dim);
+}
+.seg-item.active {
+  border-color: var(--accent);
+  color: var(--text);
+  background: color-mix(in srgb, var(--accent) 18%, var(--panel));
+  font-weight: 600;
+}
+
+pre#out {
+  max-height: 42vh;
+  margin: 4px 0 0;
+  padding: 10px;
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--input);
+  color: var(--text);
+  font: 12px/1.45 ui-monospace, "Cascadia Mono", Menlo, monospace;
+  white-space: pre-wrap;
+}
+code { color: var(--warn); }
+
+/* 输出面板的复制按钮与一闪而过的提示条 */
+.outhead { display:flex; align-items:center; justify-content:space-between; gap:8px; margin:0 0 6px; }
+button.mini { padding:5px 10px; font-size:12px; border-radius:6px; }
+.toast { position:fixed; left:50%; bottom:28px; transform:translateX(-50%) translateY(8px);
+         background:var(--panel2,#1c242c); color:var(--fg,#e8eef4); border:1px solid var(--line,#26313a);
+         border-radius:999px; padding:8px 16px; font-size:13px; opacity:0; pointer-events:none;
+         transition:opacity .18s, transform .18s; z-index:99; max-width:86vw; text-align:center; }
+.toast.show { opacity:1; transform:translateX(-50%) translateY(0); }
+pre#out { user-select:text; -webkit-user-select:text; }
+
+/* 需求 1：总状态整行放大。需求 7/8/9：长名字的行内换行。需求 11：详情在本行内展开。
+   需求 12：投屏应用那两个框在小屏/竖屏下自适应，不再溢出。 */
+.cat-name { display:flex; flex-direction:column; line-height:1.25; }
+.cat-name-line { display:block; font-size:13px; }
+.cat-name-line:first-child { font-size:15px; }
+.cat .detail { border-top:1px solid var(--line); margin-top:6px; padding-top:8px; }
+@media (max-width: 520px) {
+  .row { flex-wrap:wrap; }
+  .field { width:100%; }
+  .field select { width:100%; min-width:0; }
+}
+
+/* 需求：总状态行的名字必须与下面分类行的名字左对齐——给标签一个固定列宽，字号变大也不会错位。
+   第二个状态行没有名字，值居中，和总状态行中间那列对齐。 */
+.cat-name { flex:0 0 96px; }
+
+/* 需求：总状态行的名字要和下面分类行的名字左对齐——header 没有 section 的 12px 内边距，
+   所以状态行单独补 12px（之前偏左就是这个差值）。 */
+/* 投屏应用的两个框一样宽 */
+#sec-apps .row .field { flex:1 1 0; min-width:0; }
+#sec-apps .row .field select { width:100%; }
+/* 二级页面 */
+#sec-cats.page-open #cats { display:none; }
+#sec-cats.page-open h2 { display:none; }
+.cat-page .back { margin-bottom:8px; }
+.cat-page h2 { margin:0 0 8px; font-size:17px; }
+/* 输出用 textarea：原生全选/长按复制 */
+textarea#out { width:100%; background:#0c1116; color:var(--fg); border:1px solid var(--line);
+  border-radius:8px; padding:9px; font-size:12px; font-family:ui-monospace,monospace;
+  white-space:pre-wrap; word-break:break-all; resize:vertical; }
+
+/* 输出面板（textarea）：显式高对比配色，并且选区要能看出来（之前"点了全选也没反应"）。 */
+textarea#out {
+  background:#0b1015 !important; color:#e8eef4 !important;
+  -webkit-text-fill-color:#e8eef4; caret-color:#e8eef4;
+  user-select:text; -webkit-user-select:text;
+  min-height:220px; line-height:1.45;
+}
+textarea#out::selection { background:#2f6fd0; color:#ffffff; }
+textarea#out::-webkit-selection { background:#2f6fd0; color:#ffffff; }
+/* 应用选择：两行、等宽 */
+#sec-apps .field-row { flex-wrap:wrap; }
+#sec-apps .field { flex:1 1 100%; width:100%; }
+#sec-apps .field select, #sec-apps .field input { width:100%; min-width:0; }
+#sec-apps .field input[type=search] { margin:6px 0; background:var(--bg); color:var(--fg);
+  border:1px solid var(--line); border-radius:6px; padding:7px 9px; font-size:13px; }
+
+/* 状态行与分类行同结构，因此同宽同高；只有值与开关列的对齐在这里补充。 */
+.cat.status { background:var(--panel2); font-weight:600; }
+.cat.status .cat-name { font-size:15px; }
+.cat.status .cat-val { font-size:15px; }
+.cat.status .cat-val.center { flex:1; text-align:center; }
+.sw-box { display:flex; align-items:center; }
+.hidden-select { display:none; }
+/* 自带搜索的下拉 */
+.picker { position:relative; width:100%; }
+.picker-btn { width:100%; text-align:left; background:var(--bg); color:var(--fg);
+  border:1px solid var(--line); border-radius:6px; padding:8px 9px; font-size:13px; }
+.picker-panel { position:absolute; z-index:20; left:0; right:0; margin-top:4px;
+  background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:8px;
+  box-shadow:0 6px 20px rgba(0,0,0,.45); }
+.picker-panel input[type=search] { width:100%; margin-bottom:6px; background:var(--bg);
+  color:var(--fg); border:1px solid var(--line); border-radius:6px; padding:7px 9px; font-size:13px; }
+.picker-list { max-height:46vh; overflow:auto; }
+.picker-item { padding:8px 6px; border-bottom:1px solid var(--line); font-size:13px; }
+.picker-item:last-child { border-bottom:0; }
+.picker-item.active { color:var(--accent); }
+.picker-item.empty { color:var(--dim); }
+
+/* 页内错误横幅 */
+#err-banner { background:#3a1116; color:#ffb4b4; border:1px solid #7a2630; border-radius:8px;
+  padding:8px; margin:0 0 10px; font-size:12px; white-space:pre-wrap; }
+
+/* 码率/帧率：滑条与数字输入并排，数字框也能直接手输 */
+.qos-row { align-items:center; gap:8px; flex-wrap:nowrap; }
+.qos-label { flex:0 0 84px; font-size:13px; color:var(--dim); }
+.qos-row input[type=range] { flex:1 1 auto; min-width:0; }
+.qos-row input[type=number] { flex:0 0 92px; background:var(--bg); color:var(--fg);
+  border:1px solid var(--line); border-radius:6px; padding:6px 8px; font-size:13px; }
+.qos-unit { flex:0 0 40px; font-size:12px; color:var(--dim); }

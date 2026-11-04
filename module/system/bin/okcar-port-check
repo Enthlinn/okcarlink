@@ -1,0 +1,83 @@
+#!/system/bin/sh
+# okcar-port-check -- 手动验证入口，替代旧 README 里那段写死路径的片段。
+#
+# 为什么要有它：外发版本里的验证片段是
+#     MOD=/data/adb/modules/okcar-port
+#     $MOD/system/bin/okcar-linkd status
+# 路径写死了完整包的 id。装的是 lite 包（id = okcar-port-lite）时，第 5 行就会得到
+#     sh: <stdin>[5]: /data/adb/modules/okcar-port/system/bin/okcar-linkd: inaccessible or not found
+# 这里改成从本脚本自身位置推出模块目录（它在 <模块>/system/bin/ 下），并对四种布局都做兜底探测：
+# 完整包 / lite 包 / 重命名后的 okcarlink × modules / modules_update。找不到就直说找不到，不去猜。
+#
+# 用法：
+#   su -c 'okcar-port-check'            # 看路径 + 守护进程状态 + 会话状态 + 日志尾
+#   su -c 'okcar-port-check start'      # 先拉起守护进程再做上面的检查
+#   su -c 'okcar-port-check where'      # 只打印路径
+#   su -c 'okcar-port-check caps'       # 自检机器前提（已解锁 + KernelSU）与本模块需要的标准接口，新机器第一件事就跑它
+
+CTL_DIR=${0%/*}
+MODULE_DIR=$(cd "$CTL_DIR/../.." 2>/dev/null && pwd)
+
+resolve_module() {
+  # 1) 本脚本所在的模块目录（最可靠：脚本就在包里）
+  if [ -f "$MODULE_DIR/module.prop" ]; then echo "$MODULE_DIR"; return 0; fi
+  # 2) the installed module-dir layouts, including the renamed okcarlink id
+  for d in /data/adb/modules/okcar-port /data/adb/modules_update/okcar-port \
+           /data/adb/modules/okcar-port-lite /data/adb/modules_update/okcar-port-lite \
+           /data/adb/modules/okcarlink /data/adb/modules_update/okcarlink; do
+    [ -f "$d/module.prop" ] && { echo "$d"; return 0; }
+  done
+  return 1
+}
+
+MOD=$(resolve_module) || {
+  echo "okcar-port-check: 找不到模块目录（本脚本位置 $MODULE_DIR、modules/modules_update 下都没有 module.prop）"
+  exit 1
+}
+L=$MOD/system/bin/okcar-linkd
+ID=$(sed -n 's/^id=//p' "$MOD/module.prop" 2>/dev/null | head -n1)
+
+echo "module_dir=$MOD"
+echo "module_id=$ID"
+echo "linkd=$L"
+[ -x "$L" ] || { echo "okcar-port-check: $L 不存在或不可执行 —— 这个包不完整，或路径推错了"; exit 1; }
+
+if [ "$1" = "where" ]; then
+  exit 0
+fi
+
+if [ "$1" = "caps" ]; then
+  C=$MOD/system/bin/okcar-port-ctl
+  [ -x "$C" ] && exec "$C" caps "${2:-}"
+  echo "okcar-port-check: 找不到 $C"; exit 1
+fi
+
+if [ "$1" = "start" ]; then
+  echo "--- start ---"
+  "$L" start
+  sleep 3
+fi
+
+echo "--- 安装/激活状态（装完没重启最常见）---"
+for m in /data/adb/modules /data/adb/modules_update; do
+  [ -f "$m/$ID/module.prop" ] && echo "$m/$ID (version=$(sed -n 's/^version=//p' "$m/$ID/module.prop"))"
+done
+if [ -f "/data/adb/modules_update/$ID/module.prop" ] && [ ! -f "/data/adb/modules/$ID/module.prop" ]; then
+  echo "!! 这个包还在 modules_update/：模块尚未激活，重启后才生效（开机钩子还没跑过）"
+fi
+echo "overlay_ctl=$( [ -x /system/bin/okcar-port-ctl ] && echo present || echo absent )"
+
+echo "--- 开机钩子日志尾（看它有没有跑、卡在哪一步）---"
+tail -n 12 /data/local/tmp/okcar-port.log 2>/dev/null || echo "(没有 /data/local/tmp/okcar-port.log：开机钩子从未执行过，模块可能没启用/没重启)"
+
+echo "--- status ---"
+"$L" status
+echo "--- send status（输出进 linkd 日志）---"
+"$L" send status
+sleep 2
+echo "--- log tail ---"
+grep -E 'linkd: ' /data/local/tmp/okcar-linkd.log 2>/dev/null | tail -n 6
+echo "--- switches ---"
+# 只取开关行：老版本 ctl 收到不认识的动词会打印用法，这里不让它冒充结果。
+"$MOD/system/bin/okcar-port-ctl" switches 2>/dev/null | grep -E '^(did|oui|trim) ' \
+  || echo "(这台机器上的 ctl 不认识 switches，或 ctl 不可用 —— 用 okcar-port-ctl status 看)" 

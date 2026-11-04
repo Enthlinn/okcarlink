@@ -1,0 +1,30 @@
+# Build outputs
+build/
+*.zip
+*.dex
+*.o
+*.a
+*.so
+*.out
+
+# Builder-supplied lockdown identity (never commit key material)
+lockdown/
+*.pem
+*.key
+*.p12
+*.jks
+
+# Android build artifacts, in case someone points a build here
+out/
+target/
+.gradle/
+local.properties
+
+# Lab-specific leak-gate patterns (never commit: these are the strings the gate blocks)
+tools/lab-patterns.local
+
+# Editor / OS noise
+.idea/
+.vscode/
+*.swp
+.DS_Store

@@ -1,0 +1,782 @@
+#!/system/bin/sh
+# okcar-linkd -- module-side supervisor for the headless link stack.
+#
+#   okcar-linkd [start|stop|status|send] [command] [daemon args...]
+#
+# Runs the module payload dex with app_process as root.  The module already runs as root, so no
+# `su` dance is needed, and there is no activity, manifest or permission prompt in the way.
+# Everything the daemon prints (including the stack's own log lines) goes to
+# /data/local/tmp/okcar-linkd.log, which the WebUI and okcar-port-ctl both read.
+#
+# Commands reach the daemon through a FIFO (the daemon reads its stdin):
+#   okcar-linkd send status          -> session + virtual-display state
+#   okcar-linkd send app <package>   -> put that app on our public virtual display
+#   okcar-linkd send app-host on|off -> off = the app never shows on the phone (car screen only)
+#   okcar-linkd send place           -> retry placing the app
+#   okcar-linkd send size auto|WxH   -> pin the screen of the head unit connected NOW (saved per
+#                                       unit and per orientation); auto = forget it, follow the unit
+#   okcar-linkd send codec auto|h264|hevc  -> pin the codec for the head unit connected NOW (saved
+#                                             per unit); auto = forget it, follow the unit
+#   okcar-linkd send start|stop
+#
+# The video face is sized per session from the head unit's own declaration, or from what `size`
+# pinned for that unit — never from a constant or from this phone's panel (see AccessoryMemory).
+# --display is only the fallback space for the input backend before a session exists.
+# MODDIR：优先脚本自身路径。被当裸命令名调用（PATH 查找、监督器 re-exec）时 $0 没有目录，
+# 原来的 ${0%/*} 会得到空串，于是 DEX 变成 /payload/okcar-link.dex、守护进程静默退出 rc=0，
+# 现场表现为"无线会话未监听"（实测 lmi）。这里必须推导 + 校验 payload 真的存在。
+case "$0" in
+  */*) MODDIR=${0%/*} ;;
+  *)   MODDIR="" ;;
+esac
+MODDIR=${MODDIR%/system/bin}
+if [ ! -f "$MODDIR/payload/okcar-link.dex" ]; then
+  for _c in /data/adb/modules/okcar-port /data/adb/modules/okcar-port-lite \
+            /data/adb/modules_update/okcar-port /data/adb/modules_update/okcar-port-lite \
+            /data/adb/ksu/modules/okcar-port /data/adb/ksu/modules/okcar-port-lite \
+            /data/adb/modules/okcarlink /data/adb/ksu/modules/okcarlink; do
+    if [ -f "$_c/payload/okcar-link.dex" ]; then MODDIR=$_c; break; fi
+  done
+fi
+# app_process aborts with "ANDROID_DATA environment variable unset" when it is started from a shell
+# that has no Android runtime environment.  Measured 2026-10-03 over SSH/adb shell: the supervisor
+# restarted the daemon every ~2 s and every life aborted (rc=0, empty log, no line printed), which
+# looks exactly like "the module is broken" — while the boot-time service.sh (full environment) and
+# the manager's WebUI (an app process) both work.  Fill the two variables in instead of making every
+# operator remember the ritual.
+[ -n "$ANDROID_DATA" ] || export ANDROID_DATA=/data
+[ -n "$ANDROID_ROOT" ] || export ANDROID_ROOT=/system
+# ... and on Android 13+ that is not enough either.  Measured on 217 (Android 15 / HyperOS) 2026-10-07:
+#
+#   $ okcar-linkd start
+#   Abort message: 'Check failed: !location.empty()
+#                    BOOTCLASSPATH and DEXOATBOOTCLASSPATH must not be empty'
+#
+# ART needs the classpath that init exports for zygote/app_process, and the three APEX roots that
+# go with it.  A root shell from the ssh channel, a WebUI cgi helper and the boot hook all differ in
+# what they inherit, so instead of hardcoding one ROM's paths, sample a process that is already
+# running under the Android runtime: init itself does NOT carry these variables anymore, but zygote,
+# system_server and every app process do.  Only variables that are still missing are filled in, so a
+# caller with a complete environment (the normal boot path) is left untouched.
+#
+# The fallback below is deliberately small: it makes ART *start* (no abort loop) and points at the
+# jars that are always in the ART APEX, but it is not the ROM's full classpath (MIUI adds
+# /system/framework/*.jar and /system_ext ones); sampling a live process is what produces the exact
+# value, and there is always one once Android is up.
+LINKD_RUNTIME_VARS="BOOTCLASSPATH DEX2OATBOOTCLASSPATH ANDROID_ART_ROOT ANDROID_I18N_ROOT ANDROID_TZDATA_ROOT ANDROID_ASSETS ANDROID_STORAGE"
+linkd_missing_vars() {
+  _m=
+  for _v in $LINKD_RUNTIME_VARS; do
+    eval "_cur=\${$_v:-}"
+    [ -n "$_cur" ] || _m="$_m $_v"
+  done
+  printf '%s' "$_m"
+}
+linkd_art_env() {
+  _missing=$(linkd_missing_vars)
+  [ -n "$_missing" ] || return 0
+  # Candidates, cheapest and most likely first.  `pidof` is a toybox applet (one fork each, ~5 ms);
+  # the `ps` fallback is for a ROM without it.  Nothing here walks all of /proc: an earlier version
+  # scanned every /proc/<pid>/comm and needed ~800 forks on 217, i.e. >10 s before the daemon was
+  # even spawned — long enough that the caller's 20 s "started?" window expired first.
+  _pids=
+  if command -v pidof >/dev/null 2>&1; then
+    for _n in zygote64 zygote32 zygote system_server com.android.systemui com.miui.home \
+              com.baidu.carlife.xiaomi com.miui.carlink; do
+      for _p in $(pidof "$_n" 2>/dev/null); do
+        case " $_pids " in *" $_p "*) ;; *) _pids="$_pids $_p" ;; esac
+      done
+    done
+  fi
+  if [ -z "$_pids" ]; then
+    _pids=$(ps -A -o PID,NAME 2>/dev/null | awk '$2 ~ /^(zygote|system_server)/ {print $1}')
+    [ -n "$_pids" ] || _pids=$(ps -A -o pid,comm 2>/dev/null | awk '$2 ~ /^(zygote|system_server)/ {print $1}')
+  fi
+  for _p in $_pids; do
+    [ -r "/proc/$_p/environ" ] || continue
+    _dump=$(tr '\0' '\n' < "/proc/$_p/environ" 2>/dev/null)
+    for _v in $_missing; do
+      eval "_cur=\${$_v:-}"
+      [ -n "$_cur" ] && continue
+      _val=$(printf '%s\n' "$_dump" | sed -n "s/^$_v=//p" | head -n 1)
+      [ -n "$_val" ] && export "$_v=$_val"
+    done
+    _missing=$(linkd_missing_vars)
+    [ -n "$_missing" ] || return 0
+  done
+  [ -n "${ANDROID_ART_ROOT:-}" ] || { [ -d /apex/com.android.art ] && ANDROID_ART_ROOT=/apex/com.android.art; }
+  [ -n "${ANDROID_I18N_ROOT:-}" ] || { [ -d /apex/com.android.i18n ] && ANDROID_I18N_ROOT=/apex/com.android.i18n; }
+  [ -n "${ANDROID_TZDATA_ROOT:-}" ] || { [ -d /apex/com.android.tzdata ] && ANDROID_TZDATA_ROOT=/apex/com.android.tzdata; }
+  if [ -z "${BOOTCLASSPATH:-}" ]; then
+    _bc=
+    for _j in "${ANDROID_ART_ROOT:-/apex/com.android.art}/javalib/core-oj.jar" \
+              "${ANDROID_ART_ROOT:-/apex/com.android.art}/javalib/core-libart.jar" \
+              /system/framework/framework.jar /system/framework/framework-graphics.jar \
+              "${ANDROID_I18N_ROOT:-/apex/com.android.i18n}/javalib/core-icu4j.jar"; do
+      [ -f "$_j" ] && _bc="$_bc$_j:"
+    done
+    [ -n "$_bc" ] && BOOTCLASSPATH=${_bc%:}
+  fi
+  [ -n "${DEX2OATBOOTCLASSPATH:-}" ] || DEX2OATBOOTCLASSPATH=${BOOTCLASSPATH:-}
+  export BOOTCLASSPATH DEX2OATBOOTCLASSPATH ANDROID_ART_ROOT ANDROID_I18N_ROOT ANDROID_TZDATA_ROOT
+}
+# A root shell from the ssh debug channel (or any hook with a minimal environment) does not
+# necessarily put /system/bin on PATH.  `app_process` and the helpers below are then "not found",
+# the supervised child dies instantly with rc=127 and the supervisor restarts it every 2 s — which
+# looks exactly like a broken module while a WebUI start (rich app environment) works fine.
+# Measured 2026-10-03 on the main phone over ssh: log showed "daemon exited (rc=127)" in a loop.
+case ":$PATH:" in
+  *:/system/bin:*) ;;
+  *) PATH="/system/bin:/system/xbin:/vendor/bin${PATH:+:$PATH}" ;;
+esac
+export PATH
+
+# Resolve app_process once, absolutely: PATH can still be odd, and a name lookup that fails here
+# costs the whole session.
+APP_PROCESS=
+for _c in app_process64 app_process32 app_process; do
+  _p=$(command -v "$_c" 2>/dev/null)
+  [ -n "$_p" ] && [ -x "$_p" ] && { APP_PROCESS=$_p; break; }
+done
+[ -n "$APP_PROCESS" ] || { echo "okcar-linkd: app_process not found (PATH=$PATH)"; exit 1; }
+# 变体标记只用来决定**默认**：MODECONF 还没有值时写进去的那一个（见 start 分支）。旧代码拿它
+# 强制 `--mode mirror`，于是不管用户选了什么，lite 一律镜像 —— 这正是"选了应用投屏还是镜像过去"
+# 和"新装默认应用投屏、连上却是镜像"两次现场的共同来源（2026-10-03 / 2026-10-18）。模式现在是
+# 文件里的值，守护进程的启动参数从文件来，supervise 每拍对账。
+LITE_MODE=0
+[ "$(cat "$MODDIR/webroot/variant" 2>/dev/null)" = "lite" ] && LITE_MODE=1
+
+DEX=$MODDIR/payload/okcar-link.dex
+# 运行时目录。真机就是 /data/local/tmp；宿主自检用 OKCAR_TMP 指到临时目录，这样包装脚本的
+# 进程语义（幂等、监督者唯一、stop 后无残留）可以在 PC 上用假 app_process 真跑出来断言。
+TMPD=${OKCAR_TMP:-/data/local/tmp}
+LOG=$TMPD/okcar-linkd.log
+PIDF=$TMPD/okcar-linkd.pid
+FIFO=$TMPD/okcar-linkd.in
+# The shared app is remembered here, not in the daemon: after a reboot service.sh starts the
+# daemon with no arguments, so without a file the target app was silently lost and the car fell
+# back to mirroring the phone's own screen (measured on 217 after the first reboot with Pano).
+APPCONF=$TMPD/okcar-port-app.conf
+# Optional activity that draws the car screen's UI while the app's own launch activity stays on the
+# phone as its engine host (Pano 工作台 needs this; see RootAppDisplayFactory's app-ui option).
+APPDISPCONF=$TMPD/okcar-port-app-display.conf
+# Whether the app's normal instance may live on the phone (`on`, the Pano host workaround) or the
+# car screen must be the only place it shows (`off`).  Persisted like the app itself.
+HOSTCONF=$TMPD/okcar-port-app-host.conf
+MODECONF=$TMPD/okcar-port-mode
+# Whether the daemon may pull a task that wandered off back to the car display (that move
+# recreates the activity, i.e. it looks like a restart, so it can be switched off).
+KEEPERCONF=$TMPD/okcar-port-keeper.conf
+# Supervision state.  `supervise` keeps the daemon up and `stop` is the only thing that takes the
+# marker away, so a deliberate stop is never undone by the supervisor.
+SUPERVISE=$TMPD/okcar-linkd.supervise
+SUPPID=$TMPD/okcar-linkd.supervise.pid
+# 监督者唯一性的原子占位（mkdir 是原子的）。旧的"pgrep 检查 + 起监督者"是 check-then-act：
+# 两次并发 start（WebUI 看门狗 + service.sh/手工）会同时通过检查，各起一个监督者，
+# 两个监督者再各自 stop_daemon + 拉起，于是现场同时存在两个 LinkDaemon（2026-10-04 一次会话复现 4 次）。
+SUPLOCK=$TMPD/okcar-linkd.supervise.lock
+# 监督者判活的粒度：每 2s 看一次守护进程，连续缺席这么多拍（≈12s）就认定子壳卡死并替换它。
+SUPERVISE_ABSENT_TICKS=6
+# 镜像会话期间被压下去的系统动画，原值记在这里（还原用）
+ANIMSAVED=$TMPD/okcar-animations.saved
+ANIMKEYS="window_animation_scale transition_animation_scale animator_duration_scale"
+DAEMON_CLASS=com.okcar.link.daemon.LinkDaemon
+
+# True when $1 is a live process whose command line really is ours.  A bare `kill -0` is not
+# enough: /data/local/tmp survives a reboot on HyperOS 4, so after a restart the recorded pid is
+# very often *some other* process that inherited the number — trusting it made supervise print
+# "already supervising" and never start the daemon (measured 2026-10-03: boot log said
+# "already supervising pid=4169" while the phone had no daemon at all).
+pid_is_ours() {
+  _p=$1
+  [ -n "$_p" ] || return 1
+  kill -0 "$_p" 2>/dev/null || return 1
+  case "$(tr '\0' ' ' < "/proc/$_p/cmdline" 2>/dev/null)" in
+    *okcar-linkd*supervise*) return 0 ;;
+  esac
+  return 1
+}
+
+# The daemon itself, for stop_daemon's kill: same reasoning, but matched on the daemon class.
+pid_is_daemon() {
+  _p=$1
+  [ -n "$_p" ] || return 1
+  kill -0 "$_p" 2>/dev/null || return 1
+  case "$(tr '\0' ' ' < "/proc/$_p/cmdline" 2>/dev/null)" in
+    *"$DAEMON_CLASS"*) return 0 ;;
+  esac
+  return 1
+}
+
+# 守护进程实际在跑的模式，从它自己的命令行读（`--mode mirror|app`）。没有这个参数就是 app：
+# LinkDaemon 的 mirrorMode 默认 false。status 用它报"现在是什么"，supervise 用它和文件对账。
+daemon_mode() {
+  _dp=$(pgrep -f "$DAEMON_CLASS" 2>/dev/null | head -n 1)
+  [ -n "$_dp" ] || return 0
+  tr '\0' ' ' < "/proc/$_dp/cmdline" 2>/dev/null | sed -n 's/.*--mode[ =]\([^ ]*\).*/\1/p'
+}
+
+# ---- 冻结保护（freezer pin）------------------------------------------------------------
+# 守护进程继承的是**启动者的 cgroup**。实测 2026-10-11 在 217：从 KernelSU/WebUI 路径（`su`）启动时
+# 它落在 /uid_10305/pid_11863 —— KernelSU 管理器 App 自己的 cgroup 里；息屏后系统冻结那个 App，
+# 我们的守护进程跟着冻死（`/proc/<pid>/wchan = do_freezer_trap`，所有线程同一状态），主机（模拟器）
+# 拿不到 CarKit 应答就每秒重枚举（dmesg 里 `read descriptors`/`read strings`，那次累计 463 条）
+# 猛顶 USB，217 整机卡死。而 top-app cpuset（AppPriorityWatch 那套，管的是 CPU 份额）并不阻止冻结，
+# 所以必须在 cgroup 这一层把它搬走：
+#   * 目标 = uid_0（root，系统的 App 冻结器不碰它）；搬不动时只记录，绝不因此中断启动；
+#   * 顺手清掉原组的 freeze 标志（写 0 会连带解冻同组进程 —— 被冻的 App 组里往往还有别的东西）。
+# OOM/冻结与 cpuset 是两码事，别用 nice/cpuset 代替这一步。
+CGROUP_ROOT=${OKCAR_CGROUP_ROOT:-/sys/fs/cgroup}
+CGROUP_SAFE=${OKCAR_CGROUP_SAFE:-$CGROUP_ROOT/uid_0}
+# 注意两套路径不是一个命名空间：/proc/<pid>/cgroup 里读出来的是**相对 cgroup 根**的路径（如 /uid_0），
+# 而"搬进去"要写的是文件系统路径（$CGROUP_ROOT/uid_0）。拿后者去比前者永远不相等，于是每一拍都会
+# 重写一次 cgroup.procs 并把日志刷满（实测 2026-10-11：每 2 秒一条 "moved …"）。判"已经安全"必须用
+# 相对路径。
+CGROUP_SAFE_PATH=${OKCAR_CGROUP_SAFE_PATH:-/uid_0}
+
+# $1 = pid；$2 = 当前 cgroup 路径（仅供宿主自检注入，默认从 /proc/<pid>/cgroup 读）
+linkd_cgroup_pin() {
+  _pid=${1:-}
+  [ -n "$_pid" ] || return 0
+  _cur=${2:-$(sed -n 's/^0:://p' "/proc/$_pid/cgroup" 2>/dev/null)}
+  case "$_cur" in
+    "$CGROUP_SAFE_PATH"|"$CGROUP_SAFE_PATH"/*) ;;
+    *)
+      if [ -w "$CGROUP_SAFE/cgroup.procs" ] && echo "$_pid" > "$CGROUP_SAFE/cgroup.procs" 2>/dev/null; then
+        echo "$(date '+%F %T') launcher: moved pid $_pid: ${_cur:-unknown} -> $CGROUP_SAFE (freezer protection)" >> "$LOG"
+      fi
+      ;;
+  esac
+  case "$_cur" in
+    ""|"/") ;;
+    *)
+      _cf="$CGROUP_ROOT$_cur/cgroup.freeze"
+      if [ -w "$_cf" ] && [ "$(cat "$_cf" 2>/dev/null)" = "1" ]; then
+        echo 0 > "$_cf" 2>/dev/null \
+          && echo "$(date '+%F %T') launcher: cleared the freeze flag on $_cur" >> "$LOG"
+      fi
+      ;;
+  esac
+  return 0
+}
+
+# 是否存在另一个活着的监督者。
+#
+# 唯一可信的来源是**锁目录里记的占用者 pid**，绝不能用
+# `pgrep -f "okcar-linkd supervise"` 判活 —— 正在启动的监督者自己的 cmdline 就含这个串，
+# pgrep 会匹配到它自己（宿主自检里还会匹配到命令行里带该串的父进程，更是到处都是），
+# 于是"陈旧锁"分支误判"已有监督者"直接退出：陈旧锁在 /data/local/tmp 里跨重启存活，
+# 结果是**开机后守护进程永远起不来、必须手动开关一次**（2026-10-04 实测设备现场）。
+supervisor_alive() {
+  _owner=$(cat "$SUPLOCK/pid" 2>/dev/null)
+  [ -n "$_owner" ] && pid_is_ours "$_owner"
+}
+
+# 镜像会话期间把系统转场动画压到 0，用户原值留在 ANIMSAVED 里；离开镜像/停掉时原样写回。
+#
+# 现场（2026-10-04）：镜像模式下一进任何应用就整机卡死 —— `am_anr com.miui.home … Input
+# dispatching timed out` 紧接着 `am_kill … skip anr`，然后设备自己重启；把三项动画比例压到 0 之后
+# 同样操作不再死机（关掉转场动画的模糊/缩放就是去掉那个尖峰）。镜像时车机看到的就是整屏，
+# 手机自己的转场动画没有意义，所以由模块压、由模块还，不要求用户去系统设置里改。
+# persist.okcar.mirror_animations=0 可关掉这个行为。
+animations_on() {
+  # 开关优先：面板/ctl 的 anim=on|off 写在 okcar-port-switches.conf（**默认关**，面板可打开；以前默认开）。
+  # 显式 setprop persist.okcar.mirror_animations 1|0 仍可覆盖（便于脚本/现场）。
+  _anim=$(sed -n 's/^anim=//p' "$TMPD/okcar-port-switches.conf" 2>/dev/null | tail -1)
+  [ -n "$_anim" ] || _anim=off
+  case "$(getprop persist.okcar.mirror_animations 2>/dev/null)" in
+    1) _anim=on ;;
+    0) _anim=off ;;
+  esac
+  [ "$_anim" = "on" ] || return 0
+  if [ ! -f "$ANIMSAVED" ]; then
+    : > "$ANIMSAVED" 2>/dev/null || return 0
+    for _k in $ANIMKEYS; do
+      printf '%s %s\n' "$_k" "$(settings get global "$_k" 2>/dev/null)" >> "$ANIMSAVED"
+    done
+  fi
+  for _k in $ANIMKEYS; do settings put global "$_k" 0 2>/dev/null; done
+}
+
+animations_off() {
+  [ -f "$ANIMSAVED" ] || return 0
+  while read -r _k _v; do
+    [ -n "$_k" ] || continue
+    case "$_v" in
+      ''|null) ;;
+      *) settings put global "$_k" "$_v" 2>/dev/null ;;
+    esac
+  done < "$ANIMSAVED"
+  rm -f "$ANIMSAVED"
+}
+
+# 清掉"监督者已死、只剩 start 子壳"的孤儿（它的进程组已没人可杀）。判定要精确：
+# 只认 PPID=1（孤儿）且 /proc/<pid>/cmdline 里确实含 "<本脚本> start" 的进程 —— 绝不能按
+# `pgrep -f "okcar-linkd start"` 一把梭：任何命令行里提到这几个字的外壳都会被误杀。
+reap_orphan_start_shells() {
+  for _o in $(pgrep -f "[o]kcar-linkd start" 2>/dev/null); do
+    [ "$(awk '{print $4}' "/proc/$_o/stat" 2>/dev/null)" = "1" ] || continue
+    case "$(tr '\0' ' ' < "/proc/$_o/cmdline" 2>/dev/null)" in
+      *"$0 start"*) kill "$1" "$_o" 2>/dev/null ;;
+    esac
+  done
+}
+
+stop_daemon() {
+  if [ -f "$PIDF" ]; then
+    _p=$(cat "$PIDF" 2>/dev/null)
+    if [ -n "$_p" ] && ! pid_is_daemon "$_p"; then
+      # 两种可能：陈旧 pid（重启后被复用）——绝不能拿它去 kill 无辜进程；或者**守护进程已经被
+      # 上面那次组杀带走了、现在只剩僵尸**（僵尸的 cmdline 是空的，于是也判成"不是守护进程"）。
+      # 两种情况都不能只写一行日志就完事：下面照样按模式补杀一次，末尾再确认。
+      echo "okcar-linkd: pid file holds $_p which is not a live daemon (gone or reused) — will kill by pattern"
+    else
+      kill "$_p" 2>/dev/null
+    fi
+    rm -f "$PIDF"
+  fi
+  pkill -f "$DAEMON_CLASS" 2>/dev/null
+  # 必须等它真的消失：SIGTERM 是异步的，紧跟其后的 start 会把"正在退场"的进程当成"在跑"而
+  # no-op，而监督者此刻已经被 stop 收掉 —— 结果是谁都没起来（宿主自检里稳定复现）。
+  # 2 秒还不走就升级 SIGKILL，最多再等 3 秒。
+  i=0
+  while [ "$i" -lt 25 ] && pgrep -f "$DAEMON_CLASS" >/dev/null 2>&1; do
+    [ "$i" = "10" ] && pkill -KILL -f "$DAEMON_CLASS" 2>/dev/null
+    sleep 0.2
+    i=$((i + 1))
+  done
+}
+
+# 停干净：监督者连同它的整个进程组一起收掉，并等它真的消失再返回。
+# 旧版只 SIGTERM 监督者自己：它当时正在跑的子壳（LINKD_SUPERVISED=1 start）被留成孤儿，
+# 孤儿壳的 wait 返回后仍可能把守护进程再拉起来；而且 stop 立刻返回，紧随其后的 start
+# 会和正在退场的监督者抢着起进程 —— 现场就是"两个 LinkDaemon 并存"（2026-10-04 复现 4 次）。
+# setsid 起的监督者是进程组组长，负数 pid 一次性收掉整组；我们自己的 shell 不在那个组里。
+do_stop() {
+  rm -f "$SUPERVISE"
+  animations_off
+  if [ -f "$SUPPID" ]; then
+    _sp=$(cat "$SUPPID" 2>/dev/null)
+    case "$_sp" in
+      ''|*[!0-9]*) : ;;
+      *)
+        # 必须先验明这个 pid 现在**真是**我们的监督者：/data/local/tmp 里的 pid 文件跨重启存活，
+        # pid 会被复用，裸 `kill -- -<stale>` 会连带杀掉一个无辜进程组（宿主自检里就误杀过自己的
+        # shell）。验不过就只当作陈旧记录，交给下面的 pkill 按 cmdline 收。
+        if pid_is_ours "$_sp"; then
+          kill -TERM -- -"$_sp" 2>/dev/null || kill -TERM "$_sp" 2>/dev/null
+        else
+          echo "okcar-linkd: stale supervise pid ($_sp) is not ours — ignored"
+        fi
+        ;;
+    esac
+    rm -f "$SUPPID"
+  fi
+  pkill -f "okcar-linkd supervise" 2>/dev/null
+  i=0
+  while [ "$i" -lt 10 ] && pgrep -f "[o]kcar-linkd supervise" >/dev/null 2>&1; do
+    sleep 1
+    i=$((i + 1))
+  done
+  stop_daemon
+  # 事后复检：监督者、它的 start 子壳、守护进程都不能留。现场出现过"stop 报 stopped、老的一对还在"
+  # （老监督者退出时误删了新监督者的锁，于是锁与进程对不上），所以这里按 cmdline 再收一遍。
+  # 注意：不要用裸 `pkill -f "okcar-linkd start"` —— 它会把任何命令行里提到这几个字的外壳
+  # 一并杀掉（我自己的调试命令就被它杀过）。监督者的 start 子壳在它的**进程组**里，所以这里
+  # 对每个还活着的监督者做一次组杀（现场：无锁的老监督者被单独 pkill 掉后，它的 start 子壳
+  # 变成孤儿活了下来 —— 那只孤儿以后会在新守护进程死掉时再起一个，就是双守护进程）。
+  for _s in $(pgrep -f "[o]kcar-linkd supervise" 2>/dev/null); do
+    kill -TERM -- -"$_s" 2>/dev/null || kill -TERM "$_s" 2>/dev/null
+  done
+  pkill -f "[o]kcar-linkd supervise" 2>/dev/null
+  # 孤儿 start 子壳：监督者先死时它的进程组已经没人可杀（现场 30888）。模式**锚定 cmdline 开头**，
+  # 只命中"以 `sh <本脚本> start` 开头"的进程，不会误伤任何只是提到脚本名/start 字样的外壳。
+  reap_orphan_start_shells -TERM
+  sleep 1
+  pkill -KILL -f "[o]kcar-linkd supervise" 2>/dev/null
+  reap_orphan_start_shells -KILL
+  pkill -KILL -f "$DAEMON_CLASS" 2>/dev/null
+  rm -rf "$SUPLOCK" 2>/dev/null
+}
+
+case "${1:-start}" in
+  stop)
+    # The order matters: take the marker away first, so the supervisor does not restart the daemon
+    # while we are killing it.
+    do_stop
+    echo "okcar-linkd: stopped"
+    ;;
+  supervise)
+    # Keep the headless stack up.  Whatever ends the daemon — a crash in a session thread, an OOM
+    # kill, a codec race — the module comes back by itself within a second instead of leaving a
+    # connected head unit waiting for a session that no longer exists (measured 2026-10-02: an
+    # uncaught NullPointerException in the video encode thread killed the process and the receiver
+    # hung until the daemon was restarted by hand).
+    #
+    # 只允许一个监督者：mkdri 是原子的，抢不到锁时要么已有活的监督者，要么锁是上一代被强杀留下的
+    # 陈旧目录（/data/local/tmp 不随重启清空）。旧版是"先 pgrep 再起"，两次并发 start 会同时通过
+    # 检查、各起一个监督者，两个监督者再各自 stop_daemon + 拉起 —— 现场两个 LinkDaemon 并存。
+    if ! mkdir "$SUPLOCK" 2>/dev/null; then
+      if supervisor_alive; then
+        echo "okcar-linkd: already supervising pid=$(cat "$SUPLOCK/pid" 2>/dev/null)"
+        exit 0
+      fi
+      echo "okcar-linkd: breaking a stale supervise lock"
+      rm -rf "$SUPLOCK" 2>/dev/null
+      mkdir "$SUPLOCK" 2>/dev/null || { echo "okcar-linkd: another supervisor is starting"; exit 0; }
+    fi
+    printf '%s' "$$" > "$SUPLOCK/pid" 2>/dev/null
+    if [ -f "$SUPERVISE" ] && [ -f "$SUPPID" ] && pid_is_ours "$(cat "$SUPPID")"; then
+      rm -rf "$SUPLOCK" 2>/dev/null
+      echo "okcar-linkd: already supervising pid=$(cat "$SUPPID")"
+      exit 0
+    fi
+    # 标记文件在重启后可能还在（/data/local/tmp 不随重启清空），而 pid 早已属于别人：
+    # 这里显式清掉陈旧状态，否则守护进程永远不会被拉起。
+    if [ -f "$SUPERVISE" ] || [ -f "$SUPPID" ]; then
+      echo "okcar-linkd: clearing stale supervise state ($(cat "$SUPPID" 2>/dev/null))"
+      rm -f "$SUPERVISE" "$SUPPID"
+    fi
+    : > "$SUPERVISE"
+    echo $$ > "$SUPPID"
+    shift
+    while [ -f "$SUPERVISE" ]; do
+      # 盯守护进程，而不是只等子壳返回。子壳可能卡住（实测 2026-10-04 12:41：手机整体卡顿时
+      # 子壳卡在写 pid 文件那一步，守护进程被系统杀掉后留成僵尸没人收尸 —— `ps` 里守护进程是
+      # Z、子壳不动、监督者还活着但再也不重启），那种情况下"等子壳返回"永远等不到，会话再也回不来。
+      # 这里自己判活：守护进程连续缺席超过 STALL_TICKS 次就收掉卡住的子壳，重开一个。
+      LINKD_SUPERVISED=1 "$0" start "$@" &
+      child=$!
+      absent=0
+      drift=0
+      while [ -f "$SUPERVISE" ] && kill -0 "$child" 2>/dev/null; do
+        if pgrep -f "$DAEMON_CLASS" >/dev/null 2>&1; then
+          absent=0
+          # 冻结保护，每拍复核：守护进程被别的入口重启、或被系统挪回某个 App cgroup 时自愈
+          # （见 linkd_cgroup_pin；不写 USB、不碰任何会话状态，只动 cgroup 归属）
+          _dp=$(pgrep -f "$DAEMON_CLASS" 2>/dev/null | head -n 1)
+          [ -n "$_dp" ] && linkd_cgroup_pin "$_dp"
+          # 模式对账。模式是守护进程的**启动参数**，面板只写文件；两者不同步时车机上就是另一个
+          # 画面（2026-10-18 现场：文件 app、进程 --mode mirror —— 面板说应用投屏，车机上是镜像）。
+          # 连续两拍都对不上才动手，避免读到半写状态就重启一个健康的会话。
+          _want=$(cat "$MODECONF" 2>/dev/null)
+          _have=$(daemon_mode)
+          [ -n "$_have" ] || _have=app
+          if [ -n "$_want" ] && [ "$_want" != "$_have" ]; then
+            drift=$((drift + 1))
+            if [ "$drift" -ge 2 ]; then
+              echo "$(date '+%F %T') supervisor: mode drift file=$_want running=$_have — restarting the daemon so the choice takes effect" >> "$LOG"
+              drift=0
+              kill -TERM "$child" 2>/dev/null
+              sleep 1
+              kill -KILL "$child" 2>/dev/null
+              break
+            fi
+          else
+            drift=0
+          fi
+        else
+          absent=$((absent + 1))
+          if [ "$absent" -ge "$SUPERVISE_ABSENT_TICKS" ]; then
+            echo "$(date '+%F %T') supervisor: no daemon for $((absent * 2))s and the starter (pid=$child) is stuck — replacing it" >> "$LOG"
+            kill -TERM "$child" 2>/dev/null
+            sleep 1
+            kill -KILL "$child" 2>/dev/null
+            break
+          fi
+        fi
+        sleep 2
+      done
+      wait "$child" 2>/dev/null
+      [ -f "$SUPERVISE" ] || break
+      sleep 1
+    done
+    rm -f "$SUPPID"
+    # 只删**自己持有的**锁：退出时无条件 rm -rf 会把"刚接手的新监督者"的锁一起删掉，
+    # 于是新监督者变成无锁运行、再被另一次 start 看成"没有监督者"→ 出现两个监督者（2026-10-04 现场）。
+    if [ "$(cat "$SUPLOCK/pid" 2>/dev/null)" = "$$" ]; then
+      rm -rf "$SUPLOCK" 2>/dev/null
+    fi
+    ;;
+  status)
+    if pgrep -f "$DAEMON_CLASS" >/dev/null 2>&1; then
+      echo "okcar-linkd: running pid=$(pgrep -f "$DAEMON_CLASS" | tr '\n' ' ')"
+      # 正在跑的模式，取自守护进程自己的命令行。面板用它显示当前状态，而不是显示文件里"应该是
+      # 什么"：文件由面板写、进程由启动参数决定，两者不同步时面板就会撒谎（2026-10-18 现场：
+      # 文件 app、进程 --mode mirror，面板显示应用投屏、车机上是镜像）。
+      _rmode=$(daemon_mode)
+      echo "okcar-linkd: mode=${_rmode:-app}"
+      _fmode=$(cat "$MODECONF" 2>/dev/null)
+      if [ -n "$_fmode" ] && [ -n "$_rmode" ] && [ "$_fmode" != "$_rmode" ]; then
+        echo "okcar-linkd: mode drift: file=$_fmode running=$_rmode（重启守护进程才会生效）"
+      fi
+    else
+      echo "okcar-linkd: not running"
+      echo "okcar-linkd: mode=$(cat "$MODECONF" 2>/dev/null || echo app)"
+    fi
+    [ -f "$LOG" ] && tail -n 5 "$LOG"
+    ;;
+  restart)
+    # Explicit new life: drop the supervisor first, then stop and start (the WebUI's 重启 can also
+    # do stop + sleep + start; this is the one-shot form).
+    do_stop
+    sleep 1
+    shift
+    exec "$0" start "$@"
+    ;;
+  send)
+    # okcar-linkd send <command...> -- for callers that only have one shell line.
+    shift
+    [ $# -gt 0 ] || { echo "okcar-linkd: send needs a daemon command"; exit 1; }
+    # `send app <pkg>` (or a bare `app` to clear it) is also the durable setting: the target app
+    # has to survive a reboot, and the startup args come from service.sh, not from the WebUI.
+    if [ "$1" = "app" ]; then
+      shift
+      if [ $# -gt 0 ]; then printf '%s' "$1" > "$APPCONF"; else : > "$APPCONF"; fi
+      set -- app "$@"
+    fi
+    # Same for the car-screen activity: `send app-ui <pkg>/<activity>`, `send app-ui -` to clear.
+    if [ "$1" = "app-ui" ]; then
+      shift
+      case "${1:-}" in
+        ""|-|-) printf '%s' "" > "$APPDISPCONF"; set -- app-ui - ;;
+        *) printf '%s' "$1" > "$APPDISPCONF"; set -- app-ui "$@" ;;
+      esac
+    fi
+    # Same for `send keeper on|off`.
+    if [ "$1" = "keeper" ]; then
+      shift
+      case "${1:-}" in
+        on|off) printf '%s' "$1" > "$KEEPERCONF"; set -- keeper "$1" ;;
+        "") : ;;
+        *) set -- keeper "$@" ;;
+      esac
+    fi
+    # Same for `send app-host on|off` (bare `app-host` prints the current daemon view).
+    if [ "$1" = "app-host" ]; then
+      shift
+      case "${1:-}" in
+        on|off) printf '%s' "$1" > "$HOSTCONF"; set -- app-host "$1" ;;
+        "") : ;;
+        *) set -- app-host "$@" ;;
+      esac
+    fi
+    [ -p "$FIFO" ] || { echo "okcar-linkd: no fifo (daemon never started?)"; exit 1; }
+    # The FIFO lives in /data/local/tmp, so it survives a reboot even when the daemon does not
+    # (disable-linkd, or a payload that failed to start).  A plain `> "$FIFO"` then blocks forever
+    # in open(O_WRONLY) waiting for a reader — measured 2026-10-01: `okcar-linkd send status` after
+    # a reboot hung the caller and the WebUI row with it.  Refuse when the daemon is gone, and open
+    # read-write (O_RDWR never blocks) so a dying daemon cannot wedge the write either.
+    pgrep -f "$DAEMON_CLASS" >/dev/null 2>&1 \
+      || { echo "okcar-linkd: daemon not running, nothing to send to"; exit 1; }
+    exec 3<>"$FIFO"
+    printf '%s\n' "$*" >&3
+    exec 3>&-
+    echo "okcar-linkd: sent '$*'"
+    ;;
+  start|*)
+    [ -f "$DEX" ] || { echo "okcar-linkd: payload missing at $DEX"; exit 1; }
+    # Drop the verb first so everything below (including the supervisor we may spawn) sees only the
+    # real arguments, then make sure the variant's required mode is present.
+    #
+    # 注意顺序：verb 必须在这里 shift 掉，但"这是不是一次 start 调用"要先记下来。旧代码在 shift
+    # 之后才拿 $1 和 "start" 比，条件永远为假 —— 下面"幂等 no-op"和"拉起监督者"两段整块成了死代码：
+    # 每次手工/WebUI 的 start 都会 stop_daemon 后另起一个**无监督**进程，与 service.sh 起的监督者
+    # 互相 stop+重启，现场就能看到两个 LinkDaemon 并存（2026-10-04 实测）。
+    START_VERB=0
+    [ "${1:-}" = "start" ] && { START_VERB=1; shift; }
+    # 模式：MODECONF 是唯一真源 —— 面板读它、守护进程按它起，两边不会各说各的。
+    #
+    # 默认是 **mirror**：新装还没有任何应用目标，能投的就是手机屏幕本身。以前这里只在内存里回落
+    # lite=mirror、不写文件，而面板在文件缺失时兜底显示"应用投屏"，于是新装就是"面板说应用投屏、
+    # 连上却是镜像"（2026-10-18 反馈）。错的是面板那一侧的兜底，不是 mirror 这个默认 —— 把默认值
+    # 写下去、面板兜底也改成 mirror，两边天生一致。
+    #
+    # 也覆盖了 2026-10-03 的老坑：旧代码给 lite 无条件补 --mode mirror，于是"选了应用投屏还是
+    # 镜像过去"——模式是守护进程的启动参数，光写文件不生效，必须重启（对账见 supervise）。
+    case " $* " in
+      *" --mode "*|*" --mode="*) : ;;
+      *)
+        MODE_WANT=$(cat "$MODECONF" 2>/dev/null)
+        if [ -z "$MODE_WANT" ]; then
+          MODE_WANT=mirror
+          printf '%s' "$MODE_WANT" > "$MODECONF" 2>/dev/null
+          echo "okcar-linkd: 还没选过模式 — 默认 $MODE_WANT（已写入 $MODECONF，面板读同一份）"
+        fi
+        set -- "$@" --mode "$MODE_WANT"
+        ;;
+    esac
+    # a13 特制包：payload/bt-proxy.name 存在时，任何一次 start 都必须带上代理参数。
+    # WebUI 看门狗、手工 start、ctl 都可能拉起守护进程；只让开机钩子带参数的话，它们会起出
+    # 一个"不带代理"的进程，蓝牙监听又回到框架 NPE（实测 lmi）。没有这个标记时整段不生效。
+    if [ -z "${BT_PROXY_NAME:-}" ]; then
+      BT_PROXY_NAME=$(cat "$MODDIR/payload/bt-proxy.name" 2>/dev/null)
+    fi
+    if [ -n "${BT_PROXY_NAME:-}" ]; then
+      case " $* " in
+        *" --bt-proxy "*) : ;;
+        *) set -- "$@" --bt-proxy "$BT_PROXY_NAME" ;;
+      esac
+    fi
+    # Idempotent from the outside: a plain `start` must never tear down a healthy daemon.  The WebUI
+    # watchdog polls every 5 s and fires `start` the moment it catches a transient "not running"
+    # (e.g. while a restart is in flight); the old code called stop_daemon first, so every one of
+    # those polls killed the live process and dropped the AirPlay session the user was watching
+    # (measured 2026-10-03: "连接上模拟器后无线会话挂掉了").  The supervisor's own re-starts stay
+    # deliberate; `restart` is the explicit way to force a new life.
+    if [ "${LINKD_SUPERVISED:-0}" != "1" ] && [ "$START_VERB" = "1" ]; then
+      # 参数已经在上面的开头处理过（verb 已去掉、变体所需的 --mode 已补）。把 "start" 一起传进去
+      # 会让监督者每轮执行 `start start ...`，daemon 起不来。
+      # 只有"守护进程活着 **且** 还有监督者在管它"才算健康。否则（例如 stop 收掉监督者后
+      # 守护进程还差一拍才退场，或历史上某个入口起了个无监督进程）这里必须接管，而不是 no-op：
+      # 旧版只看守护进程，于是 no-op 之后监督者没了、进程也没了，现场表现为"启动没反应"。
+      if pgrep -f "$DAEMON_CLASS" >/dev/null 2>&1; then
+        if pgrep -f "[o]kcar-linkd supervise" >/dev/null 2>&1; then
+          echo "okcar-linkd: already running pid=$(cat "$PIDF" 2>/dev/null) — start is a no-op (use restart)"
+          exit 0
+        fi
+        echo "okcar-linkd: daemon runs without a supervisor — taking it over"
+      fi
+      if ! supervisor_alive; then
+        echo "okcar-linkd: starting a supervisor"
+        # 普通 start 若把 daemon 起在自己这个马上退出的 shell 里，fd 3 一关 daemon 就在 stdin
+        # EOF 上结束（"会话闪一下就没了"）。交给监督者：它持有 writer，并在 daemon 退出时重启。
+        # 并发时这里可能被抢跑，但 supervise 内的 mkdir 锁保证只有一个真的成为监督者。
+        setsid "$0" supervise "$@" >> "$LOG" 2>&1 &
+      fi
+      i=0
+      while [ "$i" -lt 20 ]; do
+        if pgrep -f "$DAEMON_CLASS" >/dev/null 2>&1; then
+          echo "okcar-linkd: started pid=$(cat "$PIDF" 2>/dev/null) under supervision"
+          exit 0
+        fi
+        sleep 1
+        i=$((i + 1))
+      done
+      echo "okcar-linkd: failed to start — log follows"
+      tail -n 20 "$LOG" 2>/dev/null
+      exit 1
+    fi
+    stop_daemon
+    sleep 1
+    # Re-attach the remembered target app unless the caller named one.  app_process is started
+    # fresh here, so this is the only place a reboot can keep the choice.
+    #
+    # ... except in mirror mode.  Mirroring means "the phone's screen is the content", and the
+    # remembered app is still on disk from an earlier app-mode session: re-attaching it is what
+    # turned a reconnect after a rotation into *app casting* (Baidu Maps on the head unit, while
+    # the touches then land on the phone).  Measured 2026-10-03.
+    MODE_HINT=$(cat "$MODECONF" 2>/dev/null)
+    if [ "$MODE_HINT" = "mirror" ]; then
+      [ -s "$APPCONF" ] && echo "okcar-linkd: mode=mirror — ignoring the remembered app ($(cat "$APPCONF"))"
+      APP_CASE=off
+    else
+      APP_CASE=on
+    fi
+    case " $* " in
+      *" --app "*|*" --app="*) : ;;
+      *)
+        if [ "$APP_CASE" = "on" ] && [ -s "$APPCONF" ]; then
+          set -- "$@" --app "$(cat "$APPCONF")"
+        fi
+        ;;
+    esac
+    case " $* " in
+      *" --app-ui "*|*" --app-ui="*) : ;;
+      *)
+        if [ "$APP_CASE" = "on" ] && [ -s "$APPDISPCONF" ]; then
+          # app-ui 必须属于被投的那个应用。完整版开机把 app-ui 默认写成我们自己的桌面
+          # （com.okcar.desktop/.DesktopActivity）；用户只换应用不动 Activity 时，那个旧值会被
+          # 原样重新挂上，车机一直停在旧界面（2026-10-04 现场："重选应用也换不掉它"）。lite 没这个
+          # 默认值所以不犯。这里把校验放在守护进程侧，旧设备/旧 conf 也能自愈。
+          _ui=$(cat "$APPDISPCONF" 2>/dev/null)
+          _pa=$(cat "$APPCONF" 2>/dev/null)
+          case " $* " in
+            *" --app "*) _pa=$(printf '%s' "$*" | sed -n 's/.*--app \([^ ][^ ]*\).*/\1/p') ;;
+          esac
+          case "$_ui" in
+            "$_pa"/*) set -- "$@" --app-ui "$_ui" ;;
+            *) echo "okcar-linkd: ignoring app-ui '$_ui' — 不属于 --app '$_pa'" ;;
+          esac
+        fi
+        ;;
+    esac
+    case " $* " in
+      *" --app-host "*|*" --app-host="*) : ;;
+      *)
+        if [ "$APP_CASE" = "on" ] && [ -s "$HOSTCONF" ]; then
+          set -- "$@" --app-host "$(cat "$HOSTCONF")"
+        fi
+        ;;
+    esac
+    case " $* " in
+      *" --keeper "*|*" --keeper="*) : ;;
+      *)
+        if [ -s "$KEEPERCONF" ]; then
+          set -- "$@" --keeper "$(cat "$KEEPERCONF")"
+        fi
+        ;;
+    esac
+    # 镜像会话：把系统转场动画压到 0（离开镜像则还原）。放在真正起守护进程之前，
+    # 这样无论第一次起还是会话重建都生效（2026-10-04：镜像下一进应用就整机死机的那条路）。
+    case " $* " in
+      *" --mode mirror "*|*" --mode=mirror"*) animations_on ;;
+      *) animations_off ;;
+    esac
+    # A supervised restart keeps the previous life's log: the reason the daemon exited is the first
+    # thing an operator needs, and truncating it here would erase exactly that evidence.
+    if [ "${LINKD_SUPERVISED:-0}" = "1" ]; then
+      echo "$(date '+%F %T') supervisor: starting daemon $*" >> "$LOG"
+    else
+      : > "$LOG"
+    fi
+    rm -f "$FIFO"
+    mkfifo "$FIFO" 2>/dev/null
+    # The car-screen app (com.okcar.desktop, an ordinary app process) sends its commands here, so the
+    # FIFO has to be writable by it; /data/local/tmp is traverse-able for apps.
+    chmod 666 "$FIFO" 2>/dev/null
+    # Open the FIFO read-write in THIS shell first: a plain `< "$FIFO"` on the child blocks on
+    # open() until some writer appears, so the daemon would never start (measured on 217: log
+    # stayed 0 bytes and pgrep found nothing).  Holding fd 3 as a writer keeps the child's open
+    # non-blocking; the daemon tolerates EOF when this shell exits and fd 3 closes.
+    exec 3<>"$FIFO"
+    # 关键：把上面这个 O_RDWR 的 fd 直接交给守护进程（<&3），不要再用 "< $FIFO" 重新打开。
+    # 重新打开是 O_RDONLY，而 start 跑在子 shell 里（LINKD_SUPERVISED=1 "$0" start），
+    # 子 shell 一退出 fd 3 就关了 —— 守护进程的 stdin 立刻 EOF 并以 rc=0 正常退出，
+    # 表现就是"模块装了但无线会话一直未监听"（实测 Magisk/lmi）。O_RDWR 在 FIFO 上永不 EOF。
+    # 这里**不能**用 nohup：nohup 会把 stdin 重定向到 /dev/null，正好覆盖掉上面继承的 FIFO fd，
+    # 于是守护进程的命令循环立刻读到 EOF 并退出（实测 Magisk/lmi："起来又没了、一直未监听"）。
+    # 守护进程本来就被 setsid 的监督者带着、也自己管理生命周期，不需要 nohup。
+    # ART will not start without the classpath init exports for zygote (see linkd_art_env above).
+    # Fill it in at the very last moment before app_process is exec'd, and leave a line in the log
+    # when something had to be guessed: "daemon exited (rc=0) with an empty log" was the field
+    # symptom of exactly this, and it cost a whole session to identify.
+    _env_needed=$(linkd_missing_vars)
+    linkd_art_env
+    [ -n "$_env_needed" ] && echo "$(date '+%F %T') launcher: filled the ART runtime env (needed:$_env_needed left:$(linkd_missing_vars))" >> "$LOG"
+    CLASSPATH="$DEX" "$APP_PROCESS" /system/bin "$DAEMON_CLASS" "$@" <&3 >> "$LOG" 2>&1 &
+    daemon_pid=$!
+    echo $daemon_pid > "$PIDF"
+    # 冻结保护：立刻把它搬出启动者的 cgroup（su/WebUI 路径会继承某个 App 的组，见 linkd_cgroup_pin）
+    linkd_cgroup_pin "$daemon_pid"
+    if [ "${LINKD_SUPERVISED:-0}" = "1" ]; then
+      # Supervised: stay in the loop's foreground so it restarts the daemon the moment it exits,
+      # whatever did it.  The log is appended to here, never truncated, so the reason for the exit
+      # survives into the next life of the daemon.
+      wait $daemon_pid
+      rc=$?
+      if [ -f "$SUPERVISE" ]; then
+        echo "$(date '+%F %T') supervisor: daemon exited (rc=$rc) — restarting" >> "$LOG"
+      fi
+      exit $rc
+    fi
+    sleep 2
+    if pgrep -f "$DAEMON_CLASS" >/dev/null 2>&1; then
+      echo "okcar-linkd: started pid=$(cat "$PIDF") dex=$DEX fifo=$FIFO args='$*'"
+    else
+      echo "okcar-linkd: failed to start — log follows"
+      tail -n 20 "$LOG" 2>/dev/null
+      exit 1
+    fi
+    ;;
+esac

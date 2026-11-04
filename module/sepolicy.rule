@@ -1,0 +1,111 @@
+# KernelSU/Magisk runtime sepolicy for okcar-port.
+#
+# Two unrelated capabilities need a rule here.  Both were measured on 217 (Android 15 / HyperOS).
+#
+# ── 1. the wpa_supplicant control interface (why this file existed) ─────────────
+# Driving a *second* station interface (p2p0) means talking to the wpa_supplicant the framework
+# already runs, over its ctrl_interface.  Android's policy lets that supplicant answer the
+# framework's own clients only, so a client in the KernelSU domain gets no reply and the tool
+# reports a dead socket while the supplicant is perfectly healthy:
+#
+#   $ wpa_cli -p /data/vendor/wifi/wpa/sockets -i <sock> status
+#   Failed to connect to non-global ctrl_ifname ... error: Connection refused
+#
+#   avc: denied { sendto } for comm="wpa_supplicant"
+#     path=/data/vendor/wifi/wpa/sockets/wpa_ctrl_4430-1
+#     scontext=u:r:hal_wifi_supplicant_default:s0 tcontext=u:r:ksu:s0
+#     tclass=unix_dgram_socket permissive=0
+#
+# The connect itself succeeds — wpa_cli's own socket is what the supplicant cannot write its reply
+# to - so the dgram sendto rule is the one that matters, and the stream and reverse rules are here
+# because the global ctrl interface (@android:vendor_wpa_wlan0, from the supplicant's -g argument)
+# is a stream socket.
+#
+# ── 2. app → daemon commands (found on 217, 2026-10-03) ─────────────────────────
+# The car-screen app (the desktop app, and the LSPosed enhancer module) sends its
+# commands to the daemon by appending one line to the FIFO /data/local/tmp/okcar-linkd.in.  That
+# FIFO is labelled shell_data_file and untrusted_app has no access to it, so every command the app
+# sent was refused with EACCES while the FIFO itself looked perfectly writable (0666):
+#
+#   avc: denied { append } for comm="okcar.carplaypp" name="okcar-linkd.in" dev="dm-55"
+#     scontext=u:r:untrusted_app_32:s0:c213,c257,c512,c768
+#     tcontext=u:object_r:shell_data_file:s0 tclass=fifo_file permissive=0
+#
+# Without this rule the app's 「桌面 / 状态刷新 / cast」 buttons silently do nothing on Android 11+.
+# The app runs in untrusted_app_32 (a plain APK with no native code of its own picks the 32-bit
+# zygote here), so both domains need the rule, the `file` rules cover the config/status files it
+# reads and the two files its own UI writes (theme / standalone), which also live under
+# /data/local/tmp.
+#
+# Trade-off, stated plainly: these rules let *any* app read and write under /data/local/tmp.  That is
+# what "root module ↔ ordinary app over a file in /data/local/tmp" costs, Android offers no way to
+# scope a sepolicy grant to a single package without giving that app its own SELinux domain, which
+# needs a platform policy build rather than a module.  The alternative would be moving the channel
+# into the app's own external files dir, it stays here because the WebUI, the LSPosed enhancer
+# (system_server) and the daemon already agree on /data/local/tmp.
+#
+# Syntax note: KernelSU parses the space-separated form and rejects the colon form
+# ("ksu:unix_dgram_socket"), and one permission per line keeps this file valid for Magisk's
+# magiskpolicy as well.  `ksud sepolicy check /data/local/tmp/<this file>` returns 0 (verified on
+# 217 on 2026-10-03).
+#
+# Comments must not contain a semicolon: ksud splits the file on ',' BEFORE stripping comments, so a
+# ',' inside a comment produced
+#   Error: Failed to parse policy statement:  the stream and reverse rules are here
+# and the whole rule file was rejected.  Measured on 217, 2026-10-03 (a file with ',' in a comment
+# fails check with rc=1, the same file without it passes with rc=0).
+allow hal_wifi_supplicant_default ksu unix_dgram_socket sendto
+allow hal_wifi_supplicant_default ksu unix_stream_socket sendto
+allow ksu hal_wifi_supplicant_default unix_dgram_socket sendto
+allow ksu hal_wifi_supplicant_default unix_stream_socket sendto
+
+allow untrusted_app shell_data_file fifo_file write
+allow untrusted_app shell_data_file fifo_file append
+allow untrusted_app shell_data_file fifo_file open
+allow untrusted_app shell_data_file fifo_file getattr
+allow untrusted_app_32 shell_data_file fifo_file write
+allow untrusted_app_32 shell_data_file fifo_file append
+allow untrusted_app_32 shell_data_file fifo_file open
+allow untrusted_app_32 shell_data_file fifo_file getattr
+allow untrusted_app shell_data_file file read
+allow untrusted_app shell_data_file file write
+allow untrusted_app shell_data_file file append
+allow untrusted_app shell_data_file file open
+allow untrusted_app shell_data_file file getattr
+allow untrusted_app_32 shell_data_file file read
+allow untrusted_app_32 shell_data_file file write
+allow untrusted_app_32 shell_data_file file append
+allow untrusted_app_32 shell_data_file file open
+allow untrusted_app_32 shell_data_file file getattr
+
+# ── 3. the okcar-carwith bridge service (A2 — 217 Android 15. 2026-10-07) ─────────
+# The CarWith component (an ordinary app — untrusted_app_32 on 217) finds the root daemon binder
+# with ServiceManager.getService("okcar-carwith").  A service name that is not listed in
+# /system/etc/selinux/plat_service_contexts is labelled default_android_service and no app may find
+# it — the lookup came back null and every step after it (prepareCast / displayId / key / touch /
+# audio) never ran:
+#
+#   avc: denied { find } for pid=17281 uid=10317 name=okcar-carwith
+#     scontext=u:r:untrusted_app_32:s0 tcontext=u:object_r:default_android_service:s0
+#     tclass=service_manager permissive=0
+#
+# These lines declare a type that only this one service name ever uses.  The NAME -> TYPE mapping
+# itself cannot live in the policy — servicemanager reads it from plat_service_contexts — so
+# post-fs-data.sh copies that file and appends the mapping and bind-mounts the copy over the
+# original and then loads the policy once more.  That last step is what makes servicemanager re-read
+# the file: it caches it and only reopens it when the policy has been reloaded.
+#
+# Only the name okcar-carwith is opened up.  Widening the whole default_android_service type instead
+# (allow untrusted_app default_android_service service_manager find) would let every app find every
+# unlabelled service on the device — that is the A1 variant the maintainer rejected.
+#
+# Syntax: the space-separated statement form is the one both root solutions accept.  Measured
+# 2026-10-08 — KernelSU 3.3.0 accepts "type X service_manager_type" and rejects "type X, attr;" while
+# Magisk 30.7 accepts the same space form and rejects the comma form too.  On an Android version
+# without untrusted_app_32 or ksu those two allow lines are reported as unknown types and skipped —
+# the rest of this file still applies (verified with magiskpolicy --load/--apply/--save on lmi).
+type okcar_carwith_service service_manager_type
+allow untrusted_app okcar_carwith_service service_manager find
+allow untrusted_app_32 okcar_carwith_service service_manager find
+allow ksu okcar_carwith_service service_manager add
+allow ksu okcar_carwith_service service_manager find

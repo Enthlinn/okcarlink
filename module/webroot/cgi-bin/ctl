@@ -1,0 +1,79 @@
+#!/system/bin/sh
+# 本机控制面板的 CGI：所有动作都调用既有 ctl / linkd，不在这里发明逻辑。
+# busybox httpd 起在 127.0.0.1，把本脚本作为 /cgi-bin/ctl 执行。
+export PATH=/system/bin:/system/xbin:/vendor/bin:/data/adb/magisk:/data/adb/ksu/bin:$PATH
+HERE=$(dirname "$0")
+MODULE=$(cd "$HERE/../.." && pwd)
+CTL="$MODULE/system/bin/okcar-port-ctl"
+LINKD="$MODULE/system/bin/okcar-linkd"
+TMPDIR=${OKCAR_PANEL_TMP:-/data/local/tmp}
+TOKEN_FILE="$TMPDIR/okcar-port-panel.token"
+
+printf 'Content-Type: text/plain; charset=utf-8\r\n\r\n'
+
+get() { printf '%s' "$QUERY_STRING" | tr '&' '\n' | sed -n "s/^$1=//p" | head -1 | sed 's/%20/ /g;s/+/ /g'; }
+want=$(cat "$TOKEN_FILE" 2>/dev/null)
+got=$(get token)
+[ -n "$want" ] && [ "$got" = "$want" ] || { echo "bad token"; exit 0; }
+
+case "$(get do)" in
+  exec)
+    # 命令与输出都走 base64：busybox httpd 的 CGI 拿 POST 体不可靠（实测只拿到第一个词），
+    # GET 的百分号转义在 shell 里也解不干净。base64 让引号/换行/空格全都不成问题。
+    # b64 是 base64url（无填充、URL 安全）：JS 用 encodeURIComponent 发出来时不会被改写。
+    # 这里绝不能做 's/+/ /g' 之类的手工解码——base64 里的 + 会被换成空格，命令就坏了（实测）。
+    RAW=$(printf '%s' "$QUERY_STRING" | tr '&' '\n' | sed -n 's/^b64=//p' | head -1 | tr -- '-_' '+/')
+    case $(( ${#RAW} % 4 )) in
+      2) RAW="$RAW==" ;;
+      3) RAW="$RAW=" ;;
+    esac
+    IN=$(printf '%s' "$RAW" | base64 -d 2>/dev/null)
+    OUTF=$TMPDIR/okcar-port-panel.exec.out
+    ERRF=$TMPDIR/okcar-port-panel.exec.err
+    sh -c "$IN" > "$OUTF" 2> "$ERRF"
+    rc=$?
+    b64url() { base64 -w0 < "$1" 2>/dev/null | tr '+/' '-_' | tr -d '=\n'; }
+    printf '{"errno":%s,"stdout":"%s","stderr":"%s"}' "$rc" "$(b64url "$OUTF")" "$(b64url "$ERRF")"
+    ;;
+  status)
+    printf 'WHO\nuid=%s user=%s\n' "$(id -u 2>/dev/null)" "$(id -un 2>/dev/null)"
+    printf '\nSTATUS\n'; head -3 "$TMPDIR/okcar-linkd.status" 2>/dev/null
+    printf '\nSWITCHES\n'; grep -v '^#' "$TMPDIR/okcar-port-switches.conf" 2>/dev/null | grep .
+    printf '\nMODE\n'; cat "$TMPDIR/okcar-port-mode" 2>/dev/null
+    printf '\nVIDEO\n'; grep -v '^#' "$TMPDIR/okcar-port-video.conf" 2>/dev/null | grep .
+    printf '\nPRIORITY\n'; grep -v '^#' "$TMPDIR/okcar-port-priority.conf" 2>/dev/null | grep .
+    ;;
+  switch) sh "$CTL" switch "$(get key)" "$(get value)" 2>&1 | tail -2 ;;
+  mode)
+    printf '%s' "$(get value)" > "$TMPDIR/okcar-port-mode"
+    sh "$CTL" switch session on >/dev/null 2>&1
+    sh "$LINKD" restart 2>&1 | tail -2
+    ;;
+  qos)
+    { echo '# okcar-port 视频码率与帧率（码率/帧率 0 = 不覆盖；音画缓冲 0 = 不延迟）'
+      echo "wireless_bitrate=$(get wl_br)"; echo "wireless_fps=$(get wl_fps)"
+      echo "wired_bitrate=$(get usb_br)"; echo "wired_fps=$(get usb_fps)"
+      # 缺省必须是 0：这是 daemon（VideoQos.VIDEO_DELAY_DEFAULT_MS）和 WebUI 用的默认值。
+      # 这里以前缺省写 300，于是同一个 conf 走 CGI 保存就凭空多出 300ms 延迟（2026-10-20）。
+      d=$(get vid_delay); [ -n "$d" ] || d=0
+      [ "$d" -ge 0 ] 2>/dev/null || d=0
+      [ "$d" -le 2000 ] 2>/dev/null || d=2000
+      echo "video_delay_ms=$d"
+      # app_render_scale 以前只有 WebUI 那条保存路径会写；CGI 保存会把上一份里的它整段丢掉，
+      # 于是"用 CGI 存一次码率"就顺手把渲染比例重置成默认，两条写入路径的结果不一致。
+      s=$(get scale); [ -n "$s" ] || s=100
+      [ "$s" -ge 25 ] 2>/dev/null || s=25
+      [ "$s" -le 100 ] 2>/dev/null || s=100
+      echo "app_render_scale=$s"
+    } > "$TMPDIR/okcar-port-video.conf"
+    echo "已保存（下次会话生效）"
+    ;;
+  apps) cat "$TMPDIR/okcar-apps.tsv" 2>/dev/null | head -400 ;;
+  app)
+    pkg=$(get pkg)
+    printf '%s' "$pkg" > "$TMPDIR/okcar-port-app.conf"
+    sh "$LINKD" send app "$pkg" 2>&1 | tail -1
+    echo "已应用 $pkg（下次会话生效）"
+    ;;
+  *) echo "unknown action" ;;
+esac

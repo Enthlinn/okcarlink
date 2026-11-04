@@ -1,0 +1,872 @@
+#!/system/bin/sh
+# OkCarLink port helper — the single root entry point for every privileged step of the
+# 217/普通安卓移植 (the port design notes §1).
+#
+#   okcar-port-ctl switches                     所有开关的当前状态（含默认值）
+#   okcar-port-ctl switch <did|oui|trim|linkd|session|anim|wired> on|off
+#                                               打开/关闭一个开关（立即生效并持久化）
+#   okcar-port-ctl apply                        只应用处于打开状态的开关（开机自启与一键启动走这里）
+#   okcar-port-ctl caps                         自检机器前提：已解锁 + KernelSU，以及各方向需要的标准接口
+#                                               （configfs/FunctionFS、usb_role、usbfs、uinput）
+#   okcar-port-ctl where                        这台机器上的模块目录/id/ctl/守护进程路径
+#   okcar-port-ctl platform                     这台机器的事实（root 框架/Android/WebUI/SE/bt.mac）
+#   okcar-port-ctl status                       全量现状（开关 + DID + 蓝牙地址/名字 + wm size）
+#
+#   兼容的历史动词（WebUI 与现场脚本仍在用）：
+#   okcar-port-ctl oui | spoof-bt | restore-bt | bt-did | bt-name [name]
+#   okcar-port-ctl bt-sdp [show|trim-min|trim-full|restore]
+#   okcar-port-ctl wm <WxH>|reset | grant | net-recover
+#
+# ── 三个独立开关（默认值在 DEFAULT_* 里，第一次运行即落盘） ────────────────────────
+#
+#   did  默认 **开**。写 SDP Device ID vendor（bluetooth.device_id.vendor_id=0x004C=Apple=76）。
+#        车机靠这条 SDP 记录选机，不认 MAC OUI
+#        （the pairing-status notes）。它只是一个 setprop，不需要重载蓝牙，
+#        也不改任何硬件地址，所以它是开机自启里唯一默认打开的动作。
+#
+#   oui  默认 **关**。把蓝牙 MAC 的 OUI 段改成 Apple（f0:18:98），**这需要修改蓝牙的 MAC 地址**。
+#        依据 the OUI notes：水果互联（小米车机上的 iPhone 互联 App）在
+#        code 级把 MAC OUI 拿去查 raw/mac_vendors 厂商表，lmi/217 的原厂 OUI 在表里被判成
+#        Xiaomi 而被结构性拒绝，改名字/SDP DID/CoD 全部无效——只有把 OUI 段换成 Apple 才会被
+#        认成 iPhone。**副作用**：地址一变，所有已配对设备都要重新配对；地址每开机被 nv_mac
+#        从 QMI NV 重建，所以要靠这个开关 + 射频重载去抢读。**只对水果互联有意义**，
+#        车机 不需要它。
+#
+#   trim 默认 **关**。把五个用不到的蓝牙 profile 属性关掉（OPP/SAP/MAP-NAP/PAN-NAP/PAN-PANU）。
+#        依据 the pairing-status notes §3.5：车机的发现数据库
+#        对整份 SDP 应答有容量限制（约 1600 B），记录一多就把末尾两条（我们自己的）挤掉，
+#        车机因此缓存不到 128 位 UUID、报不出无线 CarPlay 支持；把 EIR 14→9、SDP 18→13 之后
+#        supportCarplay 才会翻回 true。**它只在配对阶段需要**——车机把 SDP 缓存下来之后就不再
+#        需要裁剪了，配对成功后可以关掉并 `bt-sdp restore` 让 profile 回来。裁过头也是真的
+#        （更激进的一档把 EIR 从 14 掉到 7，车机干脆不把我们当手机分类），所以档位是显式的。
+#
+# ── 设计约束 ────────────────────────────────────────────────────────────────────
+# * 开机自启只能做“默认打开”的动作，而默认打开的只有 did；oui/trim 默认关，所以开机不会动
+#   蓝牙地址、不会重载射频，也就不会把系统起来那几秒的蓝牙监听打断。
+# * `bluetooth.profile.*` 只在蓝牙栈初始化时被读，运行中 setprop 车机看不到，所以裁剪/还原都
+#   自己重载蓝牙；用 `apply` 时这一点同样成立。
+# * 普通安卓机（至少 MIUI）直接可用：所有平台相关动作（bt.mac 路径、cmd/svc 回退、wm、
+#   settings）都先探测再执行，探测不到就如实报错，不做静默兜底。
+
+# Qualcomm/Xiaomi store the controller MAC here.  OKCAR_BT_MAC is a test hook (the module-control harness):
+# unset on a device, and the switch reports plainly when the file does not exist on another platform.
+BT_MAC=${OKCAR_BT_MAC:-/data/vendor/mac_addr/bt.mac}
+# Device ID (SDP DID) vendor: 车机 selects the phone by this record, not by the MAC OUI.
+# Apple is 76 = 0x4C; the ROM ships 0x001D (the pairing-status notes).
+DID_PROP=bluetooth.device_id.vendor_id
+DID_VENDOR=0x004C
+# Profiles we never use whose SDP records still ride in the car's full-service response.  The
+# 车机 discovery database overflows on that response (~1600 B), which drops the two
+# records at the end — ours — so the car caches no 128-bit UUID and reports no CarPlay
+# (the pairing-status notes §3.5).  Trimming these five shrinks the response from
+# 18 records to 13 and was measured to flip supportCarplay back to true (§3.7/§3.8).
+PROFILE_PROPS="bluetooth.profile.opp.enabled bluetooth.profile.sap.server.enabled bluetooth.profile.map.server.enabled bluetooth.profile.pan.nap.enabled bluetooth.profile.pan.panu.enabled"
+# SDP_TRIM_MIN (four, MAP left on) was a later hedge and is NOT the measured-good set: measured on
+# 217 (2026-10-03) a phone trimmed that way still failed after pairing while the same unit succeeded
+# with all five off.  It stays reachable as an explicit level, never as a default.
+SDP_TRIM_MIN="bluetooth.profile.opp.enabled bluetooth.profile.sap.server.enabled bluetooth.profile.pan.nap.enabled bluetooth.profile.pan.panu.enabled"
+
+# The state files live in /data/local/tmp on a device.  OQCAR_TMP exists so the switch state machine
+# can be driven by a host test with a fake root (the module-control harness); it changes nothing on a device.
+TMP=${OKCAR_TMP:-/data/local/tmp}
+BACKUP=$TMP/bt.mac.orig
+NAME_BACKUP=$TMP/bt_name.orig
+DEVNAME_BACKUP=$TMP/device_name.orig
+DID_BACKUP=$TMP/bt_did_vendor.orig
+SWITCH_FILE=$TMP/okcar-port-switches.conf
+LOG=$TMP/okcar-port.log
+NETLOG=$TMP/okcar-port-net.log
+PKG=com.okcar.link
+
+# Switch defaults.  did on: a plain setprop the head unit needs, no radio outage.
+# oui off / trim off: both rewrite or reload Bluetooth, so they are opt-in.
+DEFAULT_DID=on
+DEFAULT_OUI=off
+DEFAULT_TRIM=off
+# 守护进程与无线会话也是独立开关，和上面三个同款：默认都开（模块装来就是用的），关掉即整机关闭。
+#   linkd=off   开机不起 okcar-linkd（CarPlay 会话与虚拟屏都停），WebUI 里可再打开
+#   session=off 进程照起但不监听 RFCOMM（车机找不到手机），再打开即恢复监听
+DEFAULT_LINKD=on
+DEFAULT_SESSION=on
+# anim=off（默认）：镜像/投屏会话不碰系统转场动画。
+# anim=on：会话期间把三个动画刻度压到 0，离开时写回。以前默认是 on，所以开关文件一重建就"突然"生效；
+#          而 lite 面板根本没有这一行，关不掉（2026-10-07 反馈）。现在关掉会立即写回存档值。
+DEFAULT_ANIM=off
+# wired=off（默认）：把本机当 iPhone 设备端的有线 CarPlay —— 重新枚举成 iPhone
+#（configfs gadget 05ac:12a8 + FunctionFS usbmux + NCM），并在其上提供 com.apple.carkit.service。
+# 默认关，只用显式开关打开：它会独占整个 USB 口（USB adb 会断，本模块保留 TCP adb），
+# 只有对端是会说 CarPlay 的 USB host 时才有用。
+DEFAULT_WIRED=off
+
+log() { echo "$(date '+%F %T') $*" >> "$LOG"; }
+
+# ── switch store ───────────────────────────────────────────────────────────────
+# One `key=value` line per switch in /data/local/tmp/okcar-port-switches.conf.  Written on first
+# read so the values the module is actually running with are always visible on disk (the WebUI and
+# `status` both show this file's contents, and there is no hidden in-memory default).
+# 本模块自己的守护进程入口：覆盖层挂载过就用 /system/bin，否则用模块内路径。
+linkd_bin() {
+  # OKCAR_LINKD 是自检钩子（与 OKCAR_TMP / OKCAR_BT_MAC 同类），真机上不设。
+  if [ -n "$OKCAR_LINKD" ]; then echo "$OKCAR_LINKD"; return 0; fi
+  if [ -x /system/bin/okcar-linkd ]; then echo /system/bin/okcar-linkd
+  else echo "$(module_dir)/system/bin/okcar-linkd"; fi
+}
+
+# 关闭守护进程 = 停掉进程（supervise 也不留）；打开 = 起一个受监督的实例。
+linkd_switch_apply() {
+  _l=$(linkd_bin)
+  [ -x "$_l" ] || { echo "找不到守护进程入口 $_l"; return 1; }
+  if [ "$1" = "on" ]; then
+    # supervise 与开机一致（崩了自起），并且它自己是幂等的：已经在监督就什么都不做。
+    setsid "$_l" supervise >> "$LOG" 2>&1 &
+    sleep 2
+    echo "守护进程：$("$_l" status 2>&1 | head -n1)"
+  else
+    # stop 会先摘掉监督标记再杀进程，所以关掉之后不会被重新拉起。
+    "$_l" stop
+  fi
+}
+
+# 关闭无线会话 = 进程留着但不监听；打开 = 让它重新监听。
+session_switch_apply() {
+  _l=$(linkd_bin)
+  [ -x "$_l" ] || { echo "找不到守护进程入口 $_l"; return 1; }
+  if [ "$1" = "on" ]; then "$_l" send start; else "$_l" send stop; fi
+}
+
+# 有线 CarPlay 设备模式：启停 gadget + usbmux 守护进程，Java 监听器随之启停。
+carkit_bin() {
+  # OKCAR_CARKIT 是自检钩子（与 OKCAR_LINKD / OKCAR_TMP 同类），真机上不设。
+  if [ -n "$OKCAR_CARKIT" ]; then echo "$OKCAR_CARKIT"; return 0; fi
+  if [ -x /system/bin/okcar-carkit ]; then echo /system/bin/okcar-carkit
+  else echo "$(module_dir)/system/bin/okcar-carkit"; fi
+}
+# 主机要用有线链路之前，守护进程必须已经在抽象套接字上提供 com.apple.carkit.service。它把这个请求
+# 记在 /data/local/tmp/okcar-carkit.wanted 里，并自己轮询该文件（2 秒一次），所以在这里写文件就够了
+# —— 不必掐着时刻去捅守护进程的 FIFO，那正是镜像模式反复重启的相关因素（2026-10-06）。先把文件写
+# 下去：这样 gadget 枚举期间监听已经在位。
+wired_switch_apply() {
+  _c=$(carkit_bin)
+  [ -x "$_c" ] || { echo "找不到有线入口：$_c"; return 1; }
+  _want=$TMP/okcar-carkit.wanted
+  if [ "$1" = "on" ]; then
+    printf on > "$_want" 2>/dev/null && chmod 0644 "$_want" 2>/dev/null
+    "$_c" start full
+  else
+    printf off > "$_want" 2>/dev/null && chmod 0644 "$_want" 2>/dev/null
+    "$_c" stop
+    # stop 只管模块自己的 gadget。**野 gadget** 不在状态机里：实测 2026-10-11，用 .dev 脚本直接
+    # 改了框架的 g1（那个脚本不写开关文件），于是 `wired=off` 而 g1 上挂着 05ac:12a8 且已绑 UDC
+    # —— 有线真的能连，WebUI 却显示"关闭"，用户看到的就是"开关和实际状态不匹配"。
+    # 关开关的语义是"别再有线了"，所以这里把任何自称 Apple 的 gadget 一并收掉。
+    _fact=$("$_c" status 2>/dev/null | sed -n 's/^fact=//p' | tail -1)
+    case "$_fact" in
+      *stray=yes*) echo "发现没人管的 Apple gadget（$_fact）—— 一并回收"; "$_c" reclaim ;;
+    esac
+  fi
+}
+
+sw_default() {
+  case "$1" in
+    did) echo "$DEFAULT_DID" ;;
+    oui) echo "$DEFAULT_OUI" ;;
+    trim) echo "$DEFAULT_TRIM" ;;
+    linkd) echo "$DEFAULT_LINKD" ;;
+    session) echo "$DEFAULT_SESSION" ;;
+    anim) echo "$DEFAULT_ANIM" ;;
+    wired) echo "$DEFAULT_WIRED" ;;
+  esac
+}
+
+sw_init() {
+  if [ -f "$SWITCH_FILE" ]; then
+    # 迁移：新版本加了开关时，老装置的开关文件里没有这个键，面板就会显示空状态。
+    # 这里按默认值补上（只补缺失的键，已有值一律不动）。
+    for _k in linkd session did oui trim anim wired; do
+      grep -q "^$_k=" "$SWITCH_FILE" 2>/dev/null || echo "$_k=$(sw_default "$_k")" >> "$SWITCH_FILE"
+    done
+    return 0
+  fi
+  {
+    echo "# OkCarLink 蓝牙身份开关 — 每个开关独立；默认值见 okcar-port-ctl 头部说明"
+    echo "did=$DEFAULT_DID"
+    echo "oui=$DEFAULT_OUI"
+    echo "trim=$DEFAULT_TRIM"
+    echo "linkd=$DEFAULT_LINKD"
+    echo "session=$DEFAULT_SESSION"
+    echo "anim=$DEFAULT_ANIM"
+    echo "wired=$DEFAULT_WIRED"
+  } > "$SWITCH_FILE"
+  chmod 0644 "$SWITCH_FILE" 2>/dev/null
+}
+
+sw_get() {
+  sw_init
+  v=$(sed -n "s/^$1=//p" "$SWITCH_FILE" 2>/dev/null | tail -n 1)
+  [ -n "$v" ] && { echo "$v"; return 0; }
+  sw_default "$1"
+}
+
+sw_set() {
+  sw_init
+  key=$1
+  val=$2
+  # 读-改-写必须串行：开机钩子、WebUI 的动作与手工命令可能同时写同一个文件，原来的
+  # “删一行再追加”在并发下会留下重复行与垃圾行（实测 lmi：linkd 出现两次且第一条是 off，
+  # 开机钩子读到 off 就再也不起守护进程，表现就是“无线会话未监听”）。
+  lock="$SWITCH_FILE.lock"
+  i=0
+  while ! mkdir "$lock" 2>/dev/null; do
+    i=$((i+1)); [ "$i" -gt 100 ] && break; sleep 0.05
+  done
+  tmp="$SWITCH_FILE.tmp"
+  # 一次性重写成规范内容：固定五个键、按固定顺序、去重；任何杂行都会被丢掉。
+  {
+    echo "# OkCarLink 蓝牙身份开关 — 每个开关独立；默认值见 okcar-port-ctl 头部说明"
+    for k in linkd session did oui trim anim wired; do
+      if [ "$k" = "$key" ]; then v=$val; else v=$(sw_get "$k"); fi
+      echo "$k=$v"
+    done
+  } > "$tmp"
+  mv "$tmp" "$SWITCH_FILE"
+  chmod 0644 "$SWITCH_FILE" 2>/dev/null
+  rmdir "$lock" 2>/dev/null
+  log "switch: $key=$val"
+}
+
+# ── Bluetooth primitives ───────────────────────────────────────────────────────
+
+# A radio cycle is the only way the HAL re-reads bt.mac and the only way
+# `bluetooth.profile.*` takes effect (both are read at Bluetooth init).  `cmd bluetooth_manager`
+# is the modern entry point; `svc bluetooth` is the pre-11 one.  Report which one ran.
+bt_off() { cmd bluetooth_manager disable >/dev/null 2>&1 || svc bluetooth disable >/dev/null 2>&1; }
+bt_on()  { cmd bluetooth_manager enable  >/dev/null 2>&1 || svc bluetooth enable  >/dev/null 2>&1; }
+
+reload_bluetooth() {
+  log "bt-reload: bluetooth_manager disable/enable"
+  bt_off
+  sleep 2
+  bt_on
+  sleep 4
+  echo "蓝牙栈已重载 — 属性对当前这轮栈生效；如果车机缓存了旧 SDP 记录，请在车机上删除配对后重新配对。"
+}
+
+bt_mac_hex() { od -An -tx1 "$BT_MAC" 2>/dev/null | tr -d ' \n'; }
+
+# The live adapter address, as the framework records it (lower-case).
+live_bt_address() { settings get secure bluetooth_address 2>/dev/null | tr 'A-Z' 'a-z'; }
+
+is_apple_oui() {
+  case "$(live_bt_address)" in
+    f0:18:98*) return 0 ;;
+  esac
+  return 1
+}
+
+# ── did ────────────────────────────────────────────────────────────────────────
+# SDP DID vendor.  车机 picks the phone by this record, so it is the one Bluetooth
+# identity step that is on by default — and it is cheap: one setprop, no radio restart.
+did_apply() {
+  if [ ! -f "$DID_BACKUP" ]; then
+    getprop "$DID_PROP" > "$DID_BACKUP" 2>/dev/null
+  fi
+  before=$(getprop "$DID_PROP")
+  setprop "$DID_PROP" "$DID_VENDOR"
+  after=$(getprop "$DID_PROP")
+  log "did: $before -> $after (want $DID_VENDOR)"
+  echo "sdp_did_vendor=$after (before=$before, want $DID_VENDOR=Apple/76)"
+}
+
+did_revert() {
+  orig=$(cat "$DID_BACKUP" 2>/dev/null)
+  [ -n "$orig" ] || orig=0x001D
+  before=$(getprop "$DID_PROP")
+  setprop "$DID_PROP" "$orig"
+  log "did-off: $before -> $(getprop "$DID_PROP")"
+  echo "sdp_did_vendor=$(getprop "$DID_PROP") (restored original $orig)"
+}
+
+# ── oui ────────────────────────────────────────────────────────────────────────
+# Apple OUI on the controller MAC, for 水果互联 ONLY.
+# WARNING: this MODIFIES THE BLUETOOTH MAC ADDRESS.  Every already-paired device has to pair
+# again, and the vendor OUI bytes are rebuilt from QMI NV during Bluetooth init, so the rewrite
+# has to be re-applied after a reboot (that is what `apply` at boot / the switch is for).
+oui_apply() {
+  [ -f "$BT_MAC" ] || { log "oui: $BT_MAC missing"; echo "找不到 $BT_MAC（这台机器不用这个路径存蓝牙 MAC，OUI 开关不适用）"; return 1; }
+  [ -f "$BACKUP" ] || cp "$BT_MAC" "$BACKUP"
+  # Keep the device's own last 3 bytes (lmi approach): only the OUI segment changes.
+  set -- $(od -An -tx1 -j3 "$BT_MAC")
+  printf "\xf0\x18\x98\x$1\x$2\x$3" > "$BT_MAC"
+  log "oui: $(bt_mac_hex) (was $(od -An -tx1 "$BACKUP" | tr -d ' \n'))"
+  echo "已把 OUI 段改成 Apple：bt.mac=$(bt_mac_hex)（未重启蓝牙）"
+}
+
+oui_revert() {
+  [ -f "$BACKUP" ] || { echo "没有备份 $BACKUP — 没有可还原的出厂 MAC"; return 1; }
+  cp "$BACKUP" "$BT_MAC"
+  log "oui-off: restored $(bt_mac_hex)"
+  echo "已还原出厂 MAC：bt.mac=$(bt_mac_hex)"
+}
+
+# oui on == spoof_oui + a radio cycle that actually makes the HAL re-read it.  A radio cycle is
+# not always enough: nv_mac rebuilds bt.mac during Bluetooth init, so the HAL can come back with
+# the factory OUI (measured 2026-09-30 — bt.mac had our bytes and the live address was still
+# 24:D3:37:…).  Killing the Bluetooth process is what makes it re-read.
+spoof_bt() {
+  [ -f "$BT_MAC" ] || { log "spoof-bt: $BT_MAC missing"; echo "找不到 $BT_MAC"; return 1; }
+  [ -f "$NAME_BACKUP" ] || settings get secure bluetooth_name > "$NAME_BACKUP"
+  [ -f "$DEVNAME_BACKUP" ] || settings get global device_name > "$DEVNAME_BACKUP"
+  oui_apply >/dev/null
+  # Assert the Apple Device ID before the radio comes back: the stack builds its DID SDP record
+  # at init, so setting it afterwards would not be advertised until the next restart.
+  setprop "$DID_PROP" "$DID_VENDOR"
+  bt_off
+  sleep 2
+  bt_on
+  sleep 3
+  if [ -f "$BT_MAC" ] && ! is_apple_oui; then
+    log "spoof-bt: $(bt_mac_hex) written but the live address is $(live_bt_address) — restarting the Bluetooth process"
+    kill -9 $(pidof com.android.bluetooth) 2>/dev/null
+    sleep 8
+  fi
+  if ! is_apple_oui; then
+    log "spoof-bt: still $(live_bt_address) after the process restart — writing bt.mac again"
+    oui_apply >/dev/null
+    kill -9 $(pidof com.android.bluetooth) 2>/dev/null
+    sleep 8
+  fi
+  # The name is deliberately NOT asserted here: 水果互联 选机 is OUI-driven
+  # (the head-unit OUI notes), MIUI re-syncs the
+  # adapter name from the product model at every BT init anyway (measured
+  # 2026-09-29: settings put and bt_config.conf edits are both overwritten), and
+  # the multi-beat rewrite only extends the radio outage.  Use `bt-name` by hand
+  # if a specific accessory ever needs it.
+  log "spoof-bt: oui=$(bt_mac_hex) (name left to MIUI)"
+  echo "bt.mac=$(bt_mac_hex) bt_address=$(settings get secure bluetooth_address) bt_name=$(settings get secure bluetooth_name)"
+}
+
+restore_bt() {
+  [ -f "$BACKUP" ] || { echo "no backup $BACKUP"; return 1; }
+  cp "$BACKUP" "$BT_MAC"
+  bt_off
+  sleep 2
+  bt_on
+  sleep 5
+  if [ -s "$NAME_BACKUP" ]; then
+    settings put secure bluetooth_name "$(cat "$NAME_BACKUP")"
+  fi
+  if [ -s "$DEVNAME_BACKUP" ]; then
+    settings put global device_name "$(cat "$DEVNAME_BACKUP")"
+  fi
+  log "restore-bt: $(bt_mac_hex)"
+  echo "bt.mac=$(bt_mac_hex) bt_address=$(settings get secure bluetooth_address) bt_name=$(settings get secure bluetooth_name)"
+}
+
+# ── trim ───────────────────────────────────────────────────────────────────────
+trim_props() {
+  for p in $1; do setprop "$p" false; done
+  log "sdp-trim($2): $(for p in $1; do printf '%s=%s ' "${p##*.}" "$(getprop $p)"; done)"
+}
+
+trim_restore() {
+  for p in $PROFILE_PROPS; do setprop "$p" true; done
+  log "sdp-restore: profiles back on"
+}
+
+# ── 一键/开机应用 ──────────────────────────────────────────────────────────────
+# Only the switches that are ON are applied.  With the shipped defaults that is exactly one
+# cheap setprop (did) — no MAC rewrite, no radio outage, so boot-time Bluetooth is not disturbed.
+apply_all() {
+  # $1=boot 是 service.sh 的开机钩子。该模式下绝不应用 wired 开关：拉起 Apple gadget 会重配 USB
+  #（sys.usb.config=none、UDC 重新绑定、adbd 消失），而这台机器的 ROM 在开关文件里是 wired=on 时
+  # 因此进了开机重启循环（2026-10-06）。面板和 `switch wired on` 命令仍是刻意启动它的方式。
+  # $1=early 是 post-fs-data.sh 的开机钩子（2026-10-26 加）：它只做一件事——在蓝牙栈初始化前把 SDP DID
+  # 设上去（did 开关，一个 setprop）。它绝不碰 wired：post-fs-data 在 boot_completed 之前、且同步阻塞
+  # 开机，那时 USB 口在 init 手里；实测（2026-10-26 17:05 / 18:34 两次开机）裸 `apply` 在这里也会
+  # wired_switch_apply on ⇒ 连夺 8 次 EBUSY 后把口交还 init，60 秒后那次重试又卡死在 configfs 上
+  #（往已绑定配置链接 function 是 EINVAL，进程 D 在 configfs 目录写锁），表现就是"插线没反应、
+  # 插很多次也连不上"。oui/trim 也不在这里做：它们要蓝牙重载，交给 service.sh 的 `apply boot`。
+  _mode="${1:-manual}"
+  sw_init
+  echo "开关状态：$(grep -v '^#' "$SWITCH_FILE" | grep -v '^[[:space:]]*$' | tr '\n' ' ')"
+  if [ "$_mode" = "early" ]; then
+    if [ "$(sw_get did)" = "on" ]; then
+      did_apply
+    else
+      echo "did 开关关闭 — 不动 SDP DID"
+    fi
+    echo "early 模式 —— 只设 SDP DID；wired/oui/trim 都留给 service.sh 的 apply boot"
+    return 0
+  fi
+  changed=0
+  if [ "$(sw_get linkd)" = "on" ]; then
+    echo "linkd 开关打开 — 守护进程交给 service.sh 启动（本命令不代劳，避免与管理器重复拉起）"
+  else
+    echo "linkd 开关关闭 — 本次开机不起守护进程"
+  fi
+  if [ "$(sw_get session)" = "on" ]; then
+    echo "session 开关打开 — 守护进程起来后会监听 RFCOMM"
+  else
+    echo "session 开关关闭 — 守护进程起来后立刻停止监听"
+  fi
+  if [ "$(sw_get wired)" = "on" ]; then
+    if [ "$_mode" = "boot" ]; then
+      echo "wired 开关打开 —— 开机不启动它：它会重配 USB，有把开机拖垮的风险；"
+      echo "  接入 CarPlay 主机后再刻意启动：okcar-port-ctl switch wired on"
+      log "wired: 开关打开但 boot 模式不碰 USB（见 okcar-carkit）"
+    else
+      echo "wired 开关打开 —— 拉起 Apple gadget（USB 交给 CarPlay 设备侧）"
+      wired_switch_apply on
+    fi
+  else
+    echo "wired 开关关闭 —— USB 留给 Android"
+  fi
+  if [ "$(sw_get did)" = "on" ]; then
+    did_apply
+  else
+    echo "did 开关关闭 — 不动 SDP DID"
+  fi
+  if [ "$(sw_get oui)" = "on" ]; then
+    echo "警告：OUI 开关打开，将修改蓝牙 MAC 地址（适配水果互联；已配对设备需重新配对）"
+    spoof_bt
+    changed=1
+  else
+    echo "oui 开关关闭 — 不动蓝牙 MAC 地址"
+  fi
+  if [ "$(sw_get trim)" = "on" ]; then
+    echo "警告：裁剪开关打开（车机发现数据库容量限制；配对成功后即可关闭）"
+    trim_props "$PROFILE_PROPS" full
+    changed=1
+  else
+    echo "trim 开关关闭 — 不裁剪 profile"
+  fi
+  # Reading the props back while the stack still runs on the old values is exactly the trap that
+  # made a trimmed phone look trimmed; reload before reporting.
+  [ "$changed" = "1" ] && reload_bluetooth
+  return 0
+}
+
+# ── status / 开关展示 ──────────────────────────────────────────────────────────
+
+# ── 机器前提自检（caps） ───────────────────────────────────────────────────────
+# 本模块只面向一类机器：bootloader 已解锁 + KernelSU。它刻意不依赖任何厂商内核驱动 —— 其余全是
+# 现成接口：
+#   configfs gadget + FunctionFS + NCM   设备方向（本机当 iPhone）
+#   /sys/class/usb_role/<x>/role         主机方向（本机当 host；主线 usb_role_switch，
+#                                        也就是厂商 /dev/okcar 字符设备的标准替代）
+#   /dev/bus/usb (usbfs)                 占用车机的厂商接口
+#   /dev/uinput                          本地注入（替代厂商的 /dev/hidg0）
+# 缺哪一项就当场说清是哪一项：否则它要到很晚才以“会话就是起不来”的形式暴露出来。新机器第一件事
+# 也该是跑 `caps`。
+role_node() {
+  for _r in /sys/class/usb_role/*/role; do [ -e "$_r" ] && { echo "$_r"; return 0; }; done
+  return 1
+}
+# typec 的 data_role：2026-10-25 实测（217 / OkCarOS）—— 这台 ROM 上**唯一**推得动 TCPM 的角色
+# 节点。上面那套 usb_role 写下去毫无效果（只是 TCPM 的状态回显）；preferred_role 是只读的。
+typec_role_node() {
+  [ -e /sys/class/typec/port0/data_role ] && { echo /sys/class/typec/port0/data_role; return 0; }
+  return 1
+}
+caps_report() {
+  _ksu=no; _ksuver=-
+  if [ -x /data/adb/ksu/bin/ksud ]; then _ksu=yes; _ksuver=$(/data/adb/ksu/bin/ksud -V 2>/dev/null | head -n1); fi
+  _cfg=no
+  for _c in /config/usb_gadget /sys/kernel/config/usb_gadget; do
+    [ -d "$_c" ] && { _cfg=$_c; break; }
+  done
+  _udc=$(ls /sys/class/udc 2>/dev/null | grep -v dummy | tr '\n' ' ')
+  [ -n "$_udc" ] || _udc=-
+  _role=$(role_node) || _role=-
+  _rolecur=$([ "$_role" != "-" ] && cat "$_role" 2>/dev/null)
+  _typec=$(typec_role_node) || _typec=-
+  _typecur=$([ "$_typec" != "-" ] && cat "$_typec" 2>/dev/null)
+  _usbfs=$([ -d /dev/bus/usb ] && echo yes || echo no)
+  _uinput=$([ -e /dev/uinput ] && echo yes || echo no)
+  _ffs=$(grep -q functionfs /proc/filesystems 2>/dev/null && echo yes || echo no)
+  # 内核侧的逃生口：KernelSU 能从模块脚本里 insmod 一个 .ko（KSU 自身也可以以 LKM 形态部署）。
+  # 但到底行不行取决于内核，而且*自定义* .ko 必须按那台机器的内核构建：MODVERSIONS 会让符号 CRC
+  # 变成硬性匹配，GKI 内核还强制 CFI。这里把它报出来，是为了让这个选项按事实判断，而不是想当然。
+  # zcat 先落成一个文件：解压后的 config 约 180 KB，而 Android 的 toybox printf/echo 收不下这个
+  # 参数（"Argument list too long"），会让下面每一个计数都静默变成 0 —— 217 实测如此，而这正是
+  # 前提自检绝不能给出的那种错答案。
+  _cfgz=$TMP/okcar-cap-config.$$
+  zcat /proc/config.gz > "$_cfgz" 2>/dev/null || : > "$_cfgz"
+  _km=no
+  [ "$(cat /proc/sys/kernel/modules_disabled 2>/dev/null)" = 0 ] && [ -x /system/bin/insmod ] && _km=yes
+  _modv=$(grep -c '^CONFIG_MODVERSIONS=y' "$_cfgz" 2>/dev/null); [ -n "$_modv" ] || _modv=0
+  _cfi=$(grep -c '^CONFIG_CFI_CLANG=y' "$_cfgz" 2>/dev/null); [ -n "$_cfi" ] || _cfi=0
+  _sig=$(grep -cE '^CONFIG_MODULE_SIG=y|^CONFIG_MODULE_SIG_FORCE=y' "$_cfgz" 2>/dev/null); [ -n "$_sig" ] || _sig=0
+  rm -f "$_cfgz"
+  _boot=$([ -r /proc/device-tree ] && echo dt-ok || echo -)
+  if [ "${1:-}" = "--oneline" ]; then
+    echo "ksu=$_ksu configfs=$([ "$_cfg" = no ] && echo no || echo yes) udc=$_udc role=$([ "$_role" = - ] && echo no || echo yes) usbfs=$_usbfs uinput=$_uinput ffs=$_ffs ko=$_km"
+    return 0
+  fi
+  echo "== 机器前提（本模块需要：unlocked bootloader + KernelSU）=="
+  echo "root provider : ksu=$_ksu version=${_ksuver:--}"
+  [ "$_ksu" = yes ] || echo "                ^ 不是 KernelSU：请在已解锁的设备上安装 KernelSU 模块；只装 Magisk 的方案不在支持范围内"
+  echo "kernel        : $(uname -r 2>/dev/null)"
+  echo "== 标准接口 =="
+  echo "configfs      : $_cfg            （设备方向：gadget + FunctionFS + NCM）"
+  echo "udc           : $_udc"
+  echo "usb_role      : $_role [${_rolecur:-?}]   （主机方向：vendor /dev/okcar 的标准替代）"
+  echo "typec data_role: $_typec [${_typecur:-?}]   （217/OkCarOS 这类机型上唯一推得动 TCPM 的角色节点；usb_role 只回显）"
+  echo "usbfs         : /dev/bus/usb=$_usbfs        （占用车机的厂商接口）"
+  echo "uinput        : /dev/uinput=$_uinput         （本地注入；替代厂商 /dev/hidg0）"
+  echo "functionfs    : $_ffs"
+  echo "kernel .ko    : loadable=$_km modversions=$_modv cfi=$_cfi sig=$_sig   （KernelSU 可从模块脚本 insmod；自定义 .ko must be built for THIS kernel）
+role pin      : okcar-role start device|host   或  echo device > ${_typec:--}   （钉住角色；两端 C-to-C 的 CC 协商反复翻转时需要）"
+  echo "vendor nodes  : /dev/okcar=$([ -e /dev/okcar ] && echo present || echo absent) /dev/hidg0=$([ -e /dev/hidg0 ] && echo present || echo absent)  （absent 属预期；本模块不使用它们）"
+}
+
+show_switches() {
+  sw_init
+  # 输出形状保持易解析："<键> <状态> default=<状态> — 说明"
+  echo "linkd   $(sw_get linkd)  default=$DEFAULT_LINKD — 守护进程 okcar-linkd（CarPlay 会话与虚拟屏全由它提供）"
+  echo "session $(sw_get session)  default=$DEFAULT_SESSION — 无线会话 / RFCOMM 监听（关掉后车机找不到手机，直到再打开）"
+  echo "anim    $(sw_get anim)  default=$DEFAULT_ANIM — 会话期间自动把系统转场动画压到 0（离开时原样写回；能削掉开应用时的画面尖峰）"
+  echo "did  $(sw_get did)  default=$DEFAULT_DID — SDP DID vendor=0x004C（车机 认机用；setprop，不重载蓝牙）"
+  echo "oui  $(sw_get oui)  default=$DEFAULT_OUI — 蓝牙 MAC OUI 段改 Apple（水果互联专用；会改 MAC，需重新配对）"
+  echo "trim $(sw_get trim)  default=$DEFAULT_TRIM — 关五个未用 profile（SDP 容量限制；仅配对阶段需要）"
+  echo "wired $(sw_get wired)  default=$DEFAULT_WIRED — 有线 CarPlay 设备模式：重新枚举成 iPhone（05ac:12a8）并在 USB 上提供 com.apple.carkit.service；会独占 USB 口"
+}
+
+# ── net-recover ────────────────────────────────────────────────────────────────
+# Bringing the radio back is a two-step operation (off/on), and the shell that asks for it is
+# normally *inside* the network being bounced.  A synchronous sequence therefore runs its first
+# step and then loses the very session that was supposed to run the second one — measured
+# 2026-10-01: the phone came back with Wi-Fi off and no way in.  So the sequence is always
+# re-executed detached, and the caller only schedules it.
+net_recover() {
+  if [ "${2:-}" != "--detached" ]; then
+    setsid nohup "$0" net-recover --detached >> "$NETLOG" 2>&1 &
+    echo "net-recover: scheduled in background (log $NETLOG)"
+    return 0
+  fi
+  echo "$(date '+%F %T') net-recover: start ($(cmd wifi status 2>/dev/null | sed -n 1p))"
+  cmd wifi set-wifi-enabled enabled >/dev/null 2>&1
+  i=0
+  while [ "$i" -lt 30 ]; do
+    ssid=$(cmd wifi status 2>/dev/null | sed -n 's/^Wifi is connected to "\(.*\)"/\1/p' | head -n 1)
+    if [ -n "$ssid" ]; then
+      echo "$(date '+%F %T') net-recover: connected to \"$ssid\" $(ip -o -4 addr show wlan0 2>/dev/null | awk '{print $4}' | head -n 1)"
+      return 0
+    fi
+    sleep 2
+    i=$((i + 1))
+  done
+  echo "$(date '+%F %T') net-recover: no association after 60s, cycling the radio"
+  # Never leave the radio off: schedule a detached re-enable BEFORE switching it off.
+  setsid sh -c 'sleep 45; svc wifi enable' >/dev/null 2>&1 &
+  svc wifi disable >/dev/null 2>&1
+  sleep 4
+  svc wifi enable >/dev/null 2>&1
+  i=0
+  while [ "$i" -lt 30 ]; do
+    ssid=$(cmd wifi status 2>/dev/null | sed -n 's/^Wifi is connected to "\(.*\)"/\1/p' | head -n 1)
+    if [ -n "$ssid" ]; then
+      echo "$(date '+%F %T') net-recover: connected to \"$ssid\" after the radio cycle $(ip -o -4 addr show wlan0 2>/dev/null | awk '{print $4}' | head -n 1)"
+      return 0
+    fi
+    sleep 2
+    i=$((i + 1))
+  done
+  echo "$(date '+%F %T') net-recover: still not connected — check that a saved network is in range"
+  return 1
+}
+
+set_bt_name() {
+  settings put global device_name "$1"
+  settings put secure bluetooth_name "$1"
+}
+
+switch_set() {
+  key=$2
+  val=$3
+  case "$key" in
+    did|oui|trim|linkd|session|anim|wired) ;;
+    *) echo "未知开关 '$key'（可用：linkd / session / did / oui / trim / anim / wired）"; return 2 ;;
+  esac
+  case "$val" in
+    on|off) ;;
+    *) echo "开关值只能是 on 或 off"; return 2 ;;
+  esac
+  # 关掉开关不能等到下一次会话：现在就把用户自己的值写回去。
+  if [ "$key" = "anim" ] && [ "$val" = "off" ]; then
+    _saved=${OKCAR_ANIM_SAVED:-/data/local/tmp/okcar-animations.saved}
+    _restored=0
+    if [ -f "$_saved" ]; then
+      while read -r _k _v; do
+        [ -n "$_k" ] && [ -n "$_v" ] && { settings put global "$_k" "$_v" 2>/dev/null && _restored=$((_restored + 1)); }
+      done < "$_saved"
+      rm -f "$_saved"
+    fi
+    if [ "$_restored" -gt 0 ]; then
+      echo "anim off：已还原存档的动画刻度（$_restored 个键）"
+    else
+      # 没有存档（文件可能被清理，那样刻度会永远卡在 0，从面板也没法回头）：回落到 Android 默认值。
+      for _k in window_animation_scale transition_animation_scale animator_duration_scale; do
+        settings put global "$_k" 1.0 2>/dev/null
+      done
+      echo "anim off：没有存档记录 —— 已恢复 Android 默认值（1.0）"
+    fi
+  fi
+  sw_set "$key" "$val"
+  if [ "$key" = "linkd" ]; then
+    if [ "$val" = "off" ]; then
+      echo "警告：关闭守护进程会断开当前会话，车机将找不到手机（虚拟屏也一起停）。"
+    fi
+    linkd_switch_apply "$val"
+  elif [ "$key" = "session" ]; then
+    [ "$val" = "off" ] && echo "警告：停止监听后车机连不上，直到再打开这个开关。"
+    if [ "$val" = "on" ] && ! "$(linkd_bin)" status 2>&1 | grep -q 'okcar-linkd: running'; then
+      echo "守护进程没在跑 —— 先把 linkd 开关打开（或点详情里的「启动」）。"
+    fi
+    session_switch_apply "$val"
+  elif [ "$key" = "wired" ]; then
+    if [ "$val" = "on" ]; then
+      # 显式打开 = 用户就是要它：重新武装开机自启，并清掉之前的失败计数。
+      rm -f "$TMP/okcar-wired-boot.disabled" "$TMP/okcar-wired-boot.fails" 2>/dev/null
+      echo "警告：wired 模式会独占 USB 口，把本机重新枚举成 iPhone（05ac:12a8）。USB adb 会断；本模块保留 TCP adb。只有对端是 CarPlay 主机时才该用它。"
+      echo "它在后台启动（碰 USB 之前先脱离，因为重配 USB 会停掉 adbd）。观察：okcar-carkit status / /data/local/tmp/okcar-carkit.log"
+    fi
+    wired_switch_apply "$val"
+  elif [ "$key" = "did" ]; then
+    if [ "$val" = "on" ]; then did_apply; else did_revert; fi
+  elif [ "$key" = "oui" ]; then
+    if [ "$val" = "on" ]; then
+      echo "警告：这会把蓝牙 MAC 地址的 OUI 段改成 Apple（f0:18:98）。"
+      echo "      仅对水果互联（小米车机）有意义；车机 不需要它。"
+      echo "      地址改变后所有已配对设备都要重新配对，并且每次开机都可能要重新应用。"
+      spoof_bt
+    else
+      oui_revert
+      reload_bluetooth
+    fi
+  else
+    if [ "$val" = "on" ]; then
+      echo "警告：裁剪五个未使用的蓝牙 profile。"
+      echo "      原因：车机的发现数据库装不下整份 SDP 应答，会挤掉我们的两条记录，"
+      echo "      配对阶段就报不出无线 CarPlay 支持；裁剪后 EIR 14→9、SDP 18→13 才认。"
+      echo "      配对成功后车机已缓存 SDP，这个开关就可以关掉（关掉会还原 profile）。"
+      trim_props "$PROFILE_PROPS" full
+    else
+      trim_restore
+    fi
+    reload_bluetooth
+  fi
+  return 0
+}
+
+# ── 平台自检 ──────────────────────────────────────────────────────────────────
+# 这份模块要能装到「别的普通安卓机」上，所以把「这台机器是什么、哪些开关在它身上有意义」
+# 直接报出来，而不是让用户去猜。只读事实，不做任何修改：
+#   android=版本(api)  root=kernelsu|magisk|unknown  webui=yes|no  se=Enforcing|Permissive
+#   bt_mac=路径(found|missing)  did=当前 SDP DID
+# bt_mac 缺失 → OUI 开关在这台机器上不适用（Qualcomm/小米存这个文件，别的平台存别处）；
+# webui=no → 该用 ctl 命令而不是假装管理器页面能用。
+module_dir() { ( cd "${0%/*}/../.." 2>/dev/null && pwd ) || echo "${0%/*}/../.."; }
+module_id() { sed -n 's/^id=//p' "$(module_dir)/module.prop" 2>/dev/null | head -n1; }
+
+# 这台机器上路径到底是什么：装的是哪个包（okcar-port 还是 lite 的 okcar-port-lite）、ctl 在哪、
+# 守护进程在哪。外发脚本最常见的坑就是照抄了另一个 id 的绝对路径。
+where() {
+  _md=$(module_dir)
+  echo "module_dir=$_md"
+  echo "module_id=$(module_id)"
+  echo "ctl=$0"
+  echo "linkd=$_md/system/bin/okcar-linkd"
+  echo "overlay_ctl=$( [ -x /system/bin/okcar-port-ctl ] && echo /system/bin/okcar-port-ctl || echo '(未挂载，用模块内路径)')"
+  echo "hint=换机器/换包时用 \"okcar-port-ctl where\" 先看路径，或统一用 \"okcar-port-ctl\" 而不是写死绝对路径"
+}
+
+platform_info() {
+  _sdk=$(getprop ro.build.version.sdk)
+  _rel=$(getprop ro.build.version.release)
+  if [ -x /data/adb/ksu/bin/ksud ]; then _root=kernelsu
+  elif command -v magisk >/dev/null 2>&1 || [ -x /data/adb/magisk/magisk ]; then _root=magisk
+  else _root=unknown; fi
+  _webui=no
+  [ -d "${0%/*}/../../webroot" ] && _webui=yes
+  _se=$(getenforce 2>/dev/null || echo unknown)
+  if [ -f "$BT_MAC" ]; then _bm="$BT_MAC(found)"; else _bm="$BT_MAC(missing-OUI开关不适用)"; fi
+  echo "platform: android=$_rel(api$_sdk) root=$_root webui=$_webui se=$_se module=$(module_id) bt_mac=$_bm did=$(getprop "$DID_PROP")"
+}
+
+# ── wired 开机自启（带"自己造成重启就停用"的保护） ──────────────────────────────
+# 两个相反的教训都要照顾：
+#   * 2026-10-06：在 apply boot 里**同步**重配 USB gadget，让这台机器进了 开机→wired→重启 循环。
+#     所以这里不在开机钩子的关键路径上做，而是丢到后台、等开机稳定后再做。
+#   * 2026-10-20：另一个极端（开机完全不碰 USB）也不行——重启后 gadget 不绑、开机默认 mode=host、
+#     真 UDC 甚至没注册，用户插拔数据线毫无反应（"重插了好几次都不触发连接"）。
+# 判定用两阶段标记：拉起前写 pending（记下本次 boot_id），确认 carkit=started 才清掉。
+# 下次开机如果还留着上一代的 pending，说明那次自启没站住就被重启了——连续两次就写
+# okcar-wired-boot.disabled 永久停用自动拉起，只留手动 `switch wired on`（删掉该文件即恢复）。
+wired_boot_autostart() {
+  _delay=${1:-${OKCAR_WIRED_BOOT_DELAY:-45}}
+  # OKCAR_BOOT_ID 是自检钩子（与 OKCAR_TMP / OKCAR_LINKD 同类）：把"上一次自启后重启"的场景
+  # 在主机上复现出来，真机上不设。
+  if [ -n "${OKCAR_BOOT_ID:-}" ]; then _boot=$OKCAR_BOOT_ID
+  else _boot=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null | tr -d '-'); fi
+  _pend=$TMP/okcar-wired-boot.pending
+  _fails=$TMP/okcar-wired-boot.fails
+  _off=$TMP/okcar-wired-boot.disabled
+
+  if [ -f "$_pend" ]; then
+    _pb=$(cat "$_pend" 2>/dev/null)
+    if [ -n "$_pb" ] && [ "$_pb" != "$_boot" ]; then
+      _n=$(cat "$_fails" 2>/dev/null)
+      case "$_n" in ''|*[!0-9]*) _n=0 ;; esac
+      _n=$((_n + 1))
+      echo "$_n" > "$_fails"
+      log "wired-boot: 上一次开机自启没站住就被重启（连续 $_n 次）"
+      if [ "$_n" -ge 2 ]; then
+        : > "$_off"
+        log "wired-boot: 连续 $_n 次自启后重启 —— 已停用开机自动拉起（手动 switch wired on 仍可用；删除 $_off 恢复）"
+      fi
+    fi
+    rm -f "$_pend"
+  fi
+  if [ -f "$_off" ]; then
+    echo "有线开机自启已停用（$_off）—— 需要时手动：okcar-port-ctl switch wired on"
+    return 0
+  fi
+  if [ "$(sw_get wired)" != "on" ]; then
+    return 0
+  fi
+  # 先等 boot_completed，再额外留一段静默期：dexopt / 应用扫描期写 USB 最容易把开机拖垮。
+  _i=0
+  while [ "$_i" -lt 180 ]; do
+    [ "$(getprop sys.boot_completed 2>/dev/null)" = "1" ] && break
+    sleep 1
+    _i=$((_i + 1))
+  done
+  sleep "$_delay"
+  if [ "$(sw_get wired)" != "on" ]; then
+    log "wired-boot: 等待期间开关被关掉，不启动"
+    echo "wired 开关已关闭，不自动启动有线"
+    return 0
+  fi
+  echo "$_boot" > "$_pend"
+  log "wired-boot: 开机稳定 ${_delay}s 后自动拉起 Apple gadget"
+  echo "开机自启：拉起有线（Apple gadget）…"
+  # 先清掉上一次留下的状态：/data/local/tmp 里的 carkit.state 会跨重启保留，如果留着
+  # "started"，下面的确认循环会当场当成成功，把一次失败的拉起记成成功（也就失去了重启
+  # 循环保护）。先删，再让它自己写。
+  rm -f "$TMP/okcar-carkit.state" 2>/dev/null
+  wired_switch_apply on
+  _i=0
+  while [ "$_i" -lt 20 ]; do
+    case "$(cat "$TMP/okcar-carkit.state" 2>/dev/null)" in
+      started)
+        rm -f "$_pend" "$_fails"
+        log "wired-boot: 自启成功（carkit=started）"
+        echo "开机自启成功：有线已在跑"
+        return 0
+        ;;
+    esac
+    sleep 1
+    _i=$((_i + 1))
+  done
+  log "wired-boot: 自启没站住（state=$(cat "$TMP/okcar-carkit.state" 2>/dev/null)）"
+  echo "开机自启没站住，state=$(cat "$TMP/okcar-carkit.state" 2>/dev/null)"
+  return 1
+}
+
+case "$1" in
+  switches|switch)
+    if [ "$1" = "switch" ]; then switch_set "$@"; fi
+    show_switches
+    ;;
+  apply) apply_all "${2:-manual}" ;;
+  wired-boot) wired_boot_autostart "${2:-}" ;;
+  caps)  caps_report "${2:-}" ;;
+  bt-sdp)    CHANGED=0
+    case "${2:-show}" in
+      restore)
+        trim_restore
+        CHANGED=1
+        ;;
+      trim-min)
+        trim_props "$SDP_TRIM_MIN" min
+        CHANGED=1
+        ;;
+      trim-full)
+        trim_props "$PROFILE_PROPS" full
+        CHANGED=1
+        ;;
+      *)
+        : # show only — trimming regressed the field once, so it must be explicit
+        ;;
+    esac
+    [ "$CHANGED" = "1" ] && reload_bluetooth
+    for p in $PROFILE_PROPS; do echo "$p=$(getprop $p)"; done
+    ;;
+  bt-did)
+    echo "vendor_id(before)=$(getprop $DID_PROP)"
+    setprop "$DID_PROP" "$DID_VENDOR"
+    echo "vendor_id(after)=$(getprop $DID_PROP)"
+    ;;
+  switch-state)
+    sw_init
+    v=$(sw_get "${2:-}")
+    [ -n "$v" ] || { echo "未知开关 '${2:-}'（可用：linkd / session / did / oui / trim / anim / wired）"; exit 2; }
+    echo "$v"
+    ;;
+  platform) platform_info ;;
+  where) where ;;
+  status)
+    echo "did_vendor=$(getprop $DID_PROP) (Apple=0x004C)"
+    platform_info
+    show_switches
+    echo "self=$0 overlay_mounted=$( [ -x /system/bin/okcar-port-ctl ] && echo yes || echo no )"
+    echo "idc=$( [ -f /system/usr/idc/okcar-uinput-touch.idc ] && echo present || echo absent )"
+    echo "bt.mac=$(bt_mac_hex)"
+    echo "bt_address=$(settings get secure bluetooth_address)"
+    echo "bt_name=$(settings get secure bluetooth_name)"
+    wm size | tr '\n' ' '; echo
+    ;;
+  oui) spoof_oui ;;
+  spoof-bt) spoof_bt ;;
+  restore-bt) restore_bt ;;
+  bt-name)
+    set_bt_name "${2:-iPhone}"
+    echo "bt_name=$(settings get secure bluetooth_name) device_name=$(settings get global device_name)"
+    ;;
+  wm)
+    if [ "$2" = "reset" ]; then wm size reset; else wm size "$2"; fi
+    wm size | tr '\n' ' '; echo
+    ;;
+  net-recover)
+    net_recover "$@"
+    echo "--- $NETLOG ---"
+    tail -n 6 "$NETLOG" 2>/dev/null
+    ;;
+  stall-clear)
+    # 整机卡顿（stall）之后守护进程会把投屏冷却一段（默认 300s），窗口内不再起会话——这是故意的，
+    # 但窗口本身**到点会自动清**（WirelessCarPlaySession.armSuspensionWatch）。这个动词只给现场用：
+    # 人就在机器旁边、确认整机已经缓过来，不想再等剩下的时间时，立刻放行下一次投屏。
+    _l=$(linkd_bin)
+    [ -x "$_l" ] || { echo "找不到 okcar-linkd：$_l"; return 1 2>/dev/null || exit 1; }
+    "$_l" send stall-clear
+    ;;
+  grant)
+    for p in android.permission.RECORD_AUDIO \
+             android.permission.BLUETOOTH_CONNECT \
+             android.permission.BLUETOOTH_SCAN \
+             android.permission.BLUETOOTH_ADVERTISE \
+             android.permission.NEARBY_WIFI_DEVICES \
+             android.permission.ACCESS_FINE_LOCATION \
+             android.permission.ACCESS_COARSE_LOCATION \
+             android.permission.POST_NOTIFICATIONS \
+             android.permission.FOREGROUND_SERVICE \
+             android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION \
+             android.permission.FOREGROUND_SERVICE_MICROPHONE; do
+      pm grant "$PKG" "$p" 2>/dev/null && echo "granted $p" || echo "skip $p"
+    done
+    ;;
+  *)
+    sed -n '3,25p' "$0"
+    ;;
+esac

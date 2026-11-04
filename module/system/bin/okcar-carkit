@@ -1,0 +1,1717 @@
+#!/system/bin/sh
+# okcar-carkit —— 有线 CarPlay 手机侧：让本机在 USB 上装成一台 iPhone。
+#
+# 为什么单列一个开关：它会独占整个 USB 口（configfs gadget + FunctionFS + NCM）并重新枚举成
+# 05ac:12a8，所以只有对端是会说 CarPlay 的 USB host（车机，或第二台手机上的模拟器 用
+# C-to-C 线相连）时才有意义。它默认关，只有 `wired` 开关打开时开机钩子才会动它。
+#
+# 按下面的顺序拉起（这个顺序本身有承载作用，不能换）：
+#   1. 建 FunctionFS function 并按实例名挂载 functionfs，再起 okcar-ffs-usbmux 让它写描述符
+#      ——ffs function 还没有描述符时就绑 UDC 必失败；
+#   2. 先链接 FunctionFS、再链接 NCM（ffs 声明了固定端点地址 0x04/0x85，内核会拒绝第二个
+#      function 占用已被占用的地址）；
+#   3. 绑定 UDC；
+#   4. 让 Java 侧在抽象 socket "okcar-carkit" 上监听（okcar-linkd send carkit on），守护进程
+#      就在这里把车机在 StartService com.apple.carkit.service 之后拨入的服务端口中转出去。
+#
+# 动词：
+#   okcar-carkit start [full|ncm]   full = FunctionFS + NCM（CarPlay）；ncm = 只要网卡
+#   okcar-carkit stop               解绑、清掉我们的 function，把 USB 交还 Android（adb）
+#   okcar-carkit status             一屏事实
+#
+# start 在碰 sys.usb.config 之前一律先脱离（setsid），并写明这一点；结果落在 $STATE 和日志里。
+# 原因，2026-10-06 实测：把 sys.usb.config 置成 none 会让 init 停掉 adbd，而本脚本通常正是
+# 从 adb shell 里起的——于是它杀掉了托管自己的那个 shell，自己死在半路，手机只剩
+# sys.usb.config=none、没有 gadget 也没有 adb（只能线下恢复）。有线的 bring-up 绝不能依赖
+# 它即将拆掉的那条通道。
+#
+# 测试与其他主板可覆盖：OKCAR_UDC、OKCAR_CARKIT_TMP、NCM_IFNAME。
+set -u
+MODDIR=$(cd "${0%/*}/../.." 2>/dev/null && pwd) || MODDIR=${0%/*}/../..
+TMP=${OKCAR_CARKIT_TMP:-/data/local/tmp}
+LOG=$TMP/okcar-carkit.log
+DAEMON_LOG=$TMP/ffs-usbmux.log
+STATE=$TMP/okcar-carkit.state
+GUARD_PID=$TMP/okcar-carkit-guard.pid
+# 车机发完 0x51 之后把自己变成从设备、等我们当主机（见 okcar-ffs-usbmux.c 的 arm_role_swap）。
+# 这个标记就是"USB 角色已经交出去了"的事实：守卫看到它就不能再把 gadget 绑回 UDC，
+# 否则两边又都变成从设备，车机等 6 秒重来一次（2026-10-19 实车循环）。
+# 内容是有含义的：pending = 正在切，1 = 已经切成主机。只认这两个值 —— 2026-10-19 00:44 现场
+# 留下过一个 8 字节的坏标记 "1\nding\n"（daemon 的 write_text 当时没 O_TRUNC，短值覆盖长值后
+# 留了尾巴），而守卫只判 -f，于是它永久空转、gadget 再也不绑 UDC、有线彻底死掉且 status 还报
+# state=started。所以判据必须是"文件存在**且**内容合法"，坏内容要当垃圾清掉。
+HOST_MARKER=$TMP/okcar-usb-host
+UDC_STATE=${OKCAR_UDC_STATE:-/sys/class/udc/a600000.dwc3/state}
+
+# 读 HOST_MARKER 并归类：空输出 = 没有标记；host / pending / bad。
+# 命令替换会吃掉尾随换行，所以 "1\n" 和 "1" 同样判 host；坏标记 "1\nding\n" 读成 "1\nding"，
+# 不匹配任何一个合法值，判 bad。空文件也判 bad（既不是"没标记"也不是"已切换"，必须清掉）。
+host_marker_state() {
+  [ -f "$HOST_MARKER" ] || return 0
+  _raw=$(timeout 3 cat "$HOST_MARKER" 2>/dev/null) || { echo bad; return 0; }
+  case "$_raw" in
+    "1") echo host ;;
+    "pending") echo pending ;;
+    *) echo bad ;;
+  esac
+}
+
+# configfs 与 UDC 的读写**都会永久阻塞**：USB 栈一卡（dwc3 挂在 usb_gadget_probe_driver 里），
+# 对这些文件的 open() 就停在 D 态不返回。守卫每拍都去看 UDC，于是每拍留一个 D 态 cat，
+# load average 一路涨到 6+，整机变慢而 USB 永远回不来（2026-10-18 23:29 现场：守卫 pid 7591 底下
+# 挂了 6 个 D 态 cat，adbd 也进了 D）。
+#
+# 2026-10-21 修正：`timeout 3 cat` 根本救不了这件事，因为卡住的是 open() 而不是 read()，而 D 态
+# 进程**收不到任何信号**——SIGTERM 一直 pending，timeout 自己在 waitpid 上陪着挂住。现场实测：
+# `carkit status` 一次都跑不完，WebUI 每 5 秒探针要调它三次，于是每 5 秒泄漏 3 个 D 态 cat，
+# load 从 10 涨到 15，整机变慢、面板打不开（`webui 加载不出来` 的真实原因）。`read -t` 同样无效。
+#
+# 所以改成三层：
+#   1. 读/写都丢给**脱离的后台子进程**，父进程只等结果文件、到点就走，绝不 waitpid 一个 D 态进程；
+#   2. **断路器**：某次读/写超时后，在冷却窗口内不再碰 configfs —— 一次卡死最多留一个僵尸进程，
+#      而不是每秒一个（这是"面板打不开"的直接原因：探针每 5 秒调三次 status，每次泄漏三个 D 态
+#      cat，load 从 10 涨到 15）。
+#   3. 断路器**必须带冷却**、不能永久生效。2026-10-21 上机实测踩了这个坑：模块开机自启时正在
+#      重新绑 UDC（"taking the port"），那 2 秒里 configfs 读超时，断路器立刻武装并锁死整个
+#      开机周期 —— 于是 USB 从此再也不被监控、status 永远报 stuck，比原来还糟。
+#      所以断路器只压制 60 秒，之后自动恢复探测；连续卡死才会一直处于压制中（每 60 秒放行一次）。
+#      另：start/stop 主动清（用户可能先 switch wired off/on 重试），status 绝不主动清。
+BOOT_ID=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)
+USB_STUCK=$TMP/okcar-carkit.usb-stuck
+# 连续超时计数：只有**连续**两次读/写超时才武装断路器。
+# 单次瞬时阻塞不能武装 —— 2026-10-21 上机实测：模块开机自启时正在重新绑 UDC
+# （日志 "taking the port"），那一下 configfs 读会卡住接近 2 秒，单次超时就把整个开机周期
+# 锁死，USB 从此不再被监控、status 永远报 stuck，比原来还糟。
+USB_HITS=$TMP/okcar-carkit.usb-hits
+# 连续"放行后又确认还卡"的次数，用于指数退避（见 usb_stuck_mark）。
+USB_STREAK=$TMP/okcar-carkit.usb-streak
+# 断路器压制时长（秒）。60 秒足够让 status 快速失败、不堆积 D 态，又不至于把 USB 永久判死。
+USB_STUCK_SECS=${OKCAR_USB_STUCK_SECS:-60}
+# 武装断路器所需的连续超时次数。
+USB_STUCK_HITS=${OKCAR_USB_STUCK_HITS:-2}
+# 退避上限（秒）：永久卡死时压制窗口最多涨到这里。
+USB_STUCK_MAX=${OKCAR_USB_STUCK_MAX:-3600}
+
+# 本次开机内 USB 栈是否处于"判定卡死"的压制窗口内。
+# 文件内容是 "<boot_id> <到期时刻>"；到期自动放行（放行后如果还卡，下一次读又会重新武装）。
+usb_stuck() {
+  [ -f "$USB_STUCK" ] || return 1
+  _us=$(cat "$USB_STUCK" 2>/dev/null) || return 1
+  [ "${_us%% *}" = "$BOOT_ID" ] || return 1
+  _ue=${_us##* }
+  case "$_ue" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  [ "$_ue" -gt "$(date +%s 2>/dev/null || echo 0)" ] && return 0
+  # 已过期：清掉标记，放行一次探测。
+  rm -f "$USB_STUCK" 2>/dev/null
+  return 1
+}
+# 武装断路器，并按"连续第几次确认卡死"做指数退避。
+#
+# 为什么必须退避：冷却窗口固定时，永久卡死的机器每个窗口仍会**真的 open() 一次**（那是放行的
+# 设计目的），而每次 open 都在 D 态留一个杀不掉的进程 —— 2026-10-21 上机实测：60 秒窗口下
+# 每轮 +2 个 D 态，load 从 13 涨到 20，只是把同一个病慢放了一遍。
+#
+# 退避让"永久卡死"收敛：60s → 120s → 240s → … 封顶 1 小时，长期泄漏被压到每小时约 2 个进程；
+# 而真·瞬时抖动（开机重绑 UDC 那 2 秒）不受影响，因为**成功一次就清零 streak**
+# （usb_hit_clear），退避只对"连续失败"生效。
+usb_stuck_mark() {
+  _sk=$(cat "$USB_STREAK" 2>/dev/null)
+  case "$_sk" in ''|*[!0-9]*) _sk=0 ;; esac
+  _sk=$((_sk + 1))
+  printf %s "$_sk" > "$USB_STREAK" 2>/dev/null
+  _d=$USB_STUCK_SECS
+  _i=1
+  while [ "$_i" -lt "$_sk" ] && [ "$_d" -lt "$USB_STUCK_MAX" ]; do
+    _d=$((_d * 2))
+    _i=$((_i + 1))
+  done
+  [ "$_d" -gt "$USB_STUCK_MAX" ] && _d=$USB_STUCK_MAX
+  printf '%s %s' "$BOOT_ID" "$(( $(date +%s 2>/dev/null || echo 0) + _d ))" > "$USB_STUCK" 2>/dev/null
+  rm -f "$USB_HITS" 2>/dev/null
+}
+usb_stuck_clear() { rm -f "$USB_STUCK" "$USB_HITS" "$USB_STREAK" 2>/dev/null; }
+
+# 记一次超时：连续到阈值才武装断路器。成功一次就清零（说明只是瞬时抖动）。
+usb_hit() {
+  _uh=$(cat "$USB_HITS" 2>/dev/null)
+  case "$_uh" in ''|*[!0-9]*) _uh=0 ;; esac
+  _uh=$((_uh + 1))
+  printf %s "$_uh" > "$USB_HITS" 2>/dev/null
+  [ "$_uh" -ge "$USB_STUCK_HITS" ] && usb_stuck_mark
+  return 0
+}
+# 读成功：清连续超时计数，并把退避 streak 归零（机器已经活过来了，下一次卡死应重新从 60s 起）。
+usb_hit_clear() { rm -f "$USB_HITS" "$USB_STREAK" 2>/dev/null; }
+
+# 有界读：成功则把内容打到 stdout 并返回 0；超时（或已判卡死）返回 1。
+# 注意 stdout 只给调用者，诊断信息一律走 stderr —— 调用者大量使用 $(rd ...)。
+#
+# 轮询先密后疏：一次成功的 configfs 读只要几毫秒，若固定 sleep 0.1，光 status 里那十几次读
+# 就要一秒多（面板每 5 秒问三次 status）。所以前 0.3 秒按 10ms 问，之后按 50ms 问，总上限 2 秒。
+rd() {
+  usb_stuck && return 1
+  _rd_seq=$(( ${_rd_seq:-0} + 1 ))
+  _rd_out=$TMP/.okcar-rd.$$.$_rd_seq
+  rm -f "$_rd_out"
+  cat "$1" > "$_rd_out" 2>/dev/null &
+  _rd_pid=$!
+  _rd_n=0
+  while [ "$_rd_n" -lt 64 ]; do
+    kill -0 "$_rd_pid" 2>/dev/null || break
+    if [ "$_rd_n" -lt 30 ]; then sleep 0.01; else sleep 0.05; fi
+    _rd_n=$((_rd_n + 1))
+  done
+  if [ "$_rd_n" -ge 64 ]; then
+    # 子进程停在 D 态：杀不掉，只能放弃它，并记住这件事。
+    usb_hit
+    rm -f "$_rd_out"
+    return 1
+  fi
+  wait "$_rd_pid" 2>/dev/null
+  _rd_rc=$?
+  usb_hit_clear
+  cat "$_rd_out" 2>/dev/null
+  rm -f "$_rd_out"
+  return $_rd_rc
+}
+
+# 有界写：5 秒内没写完就放弃（同上，D 态收不到信号）。
+wr() {
+  usb_stuck && return 1
+  ( printf "%s\n" "$2" > "$1" ) 2>/dev/null &
+  _wr_pid=$!
+  _wr_n=0
+  while [ "$_wr_n" -lt 124 ]; do
+    kill -0 "$_wr_pid" 2>/dev/null || break
+    if [ "$_wr_n" -lt 30 ]; then sleep 0.01; else sleep 0.05; fi
+    _wr_n=$((_wr_n + 1))
+  done
+  if [ "$_wr_n" -ge 124 ]; then
+    usb_hit
+    return 1
+  fi
+  wait "$_wr_pid" 2>/dev/null
+  _wr_rc=$?
+  usb_hit_clear
+  return $_wr_rc
+}
+
+# configfs 内核死锁探测：与 rd() 同样是"后台读 + 有界轮询"，但**不碰断电器**（无 usb_hit、
+# 无 usb_stuck 短路）。为什么必须绕开断电器：断路器武装时 rd() 会立刻返回 1，那时分不清
+# "真的 configfs 卡死"和"断路器正在压制"；而这里必须每次都真的 open() 一次，才能拿到
+# "读不完"这个唯一的内核死锁特征。返回三态：
+#   0 = 读完了（configfs 活着，读到空也算活着）
+#   1 = 快失败（文件不存在之类，不是卡死）
+#   2 = 超时：open/read 停在 D 态永不返回。2026-10-27 11:27 现场：start 停在 clear_config 的
+#       rm 上（config_usb_cfg_unlink 持锁不放）之后，$G/UDC 的 open 全部挂死，而同目录的
+#       idVendor/idProduct 还能读——所以探测点必须就是 UDC 这个文件。
+#
+# 超时会留下一个杀不掉的 D 态 cat（D 态收不到任何信号），所以它只允许出现在低频路径：
+# start/stop 的预检（用户显式重试时各一次）和守卫判 failed 之前（守卫随后就退出）。
+# 绝不进 status/面板这类每 5 秒一轮的路径——那正是 2026-10-21 "面板打不开"的泄漏形态。
+configfs_probe() {
+  _cp_seq=$(( ${_cp_seq:-0} + 1 ))
+  _cp_out=$TMP/.okcar-probe.$$.$_cp_seq
+  rm -f "$_cp_out"
+  ( cat "$1" > "$_cp_out" 2>/dev/null ) &
+  _cp_pid=$!
+  _cp_n=0
+  while [ "$_cp_n" -lt 64 ]; do
+    kill -0 "$_cp_pid" 2>/dev/null || break
+    if [ "$_cp_n" -lt 30 ]; then sleep 0.01; else sleep 0.05; fi
+    _cp_n=$((_cp_n + 1))
+  done
+  if [ "$_cp_n" -ge 64 ]; then
+    rm -f "$_cp_out"
+    return 2
+  fi
+  wait "$_cp_pid" 2>/dev/null
+  _cp_rc=$?
+  rm -f "$_cp_out"
+  [ "$_cp_rc" = "0" ] || return 1
+  return 0
+}
+
+# 守卫在写 failed 之前的最后一步分型：连续读不通有两种——探测读也超时 = 内核 configfs
+# 死锁（用户态无解，只有重启能恢复）；探测读得完 = 只是抖动或断路器压制（老结论
+# failed:usb-stuck，用户还有 switch wired off/on 这条路可试）。把两种分开，用户才知道
+# 该做什么，而不是对着 usb-stuck 把 off/on 白试一遍（2026-10-27 现场：start 卡死之后
+# state 停在 starting，用户再插线永远没反应，就是因为没人说出"该重启"）。
+declare_usbstuck() {
+  configfs_probe "$G/UDC"
+  _du_rc=$?
+  if [ "$_du_rc" = "2" ]; then
+    log "GUARD: configfs 连续 $1 拍读不通，探测读也超时——USB 栈已在内核里卡死（configfs 死锁）；用户态解不开，请重启手机恢复"
+    set_state "failed:usb-reboot-needed"
+  else
+    log "GUARD: configfs 连续 $1 拍读不通（USB 栈卡住）——守卫退出，避免 D 态堆积；重启手机，或先 switch wired off 再 on"
+    set_state "failed:usb-stuck"
+  fi
+}
+
+# 角色专用有界写：结构与 wr() 一样（后台写 + 有界轮询），但**不碰断电器**。
+#
+# 为什么必须与 wr() 分开：wr() 超时会 usb_hit() 并给 USB_STUCK 断电器计数，用来抓"configfs
+# 卡在 D 态、再重试只会往 D 态里堆进程"这种故障。而角色节点走的是 TCPM（typec 驱动）：它忙、
+# 它不接受、它回滚，都跟 configfs 卡死没有任何关系。共用一把断电器，一次 TCPM 的短暂 BUSY
+# 就能把整条 USB 路径判成"栈卡死"（守卫随后退出、状态写成 failed:usb-stuck），真正的 configfs
+# 故障反而被这个假信号淹没。所以这里只保留"有界等待 + 超时就放弃"，不读写任何 USB 状态。
+wr_role() {
+  ( printf "%s\n" "$2" > "$1" ) 2>/dev/null &
+  _wr_pid=$!
+  _wr_n=0
+  while [ "$_wr_n" -lt 124 ]; do
+    kill -0 "$_wr_pid" 2>/dev/null || break
+    if [ "$_wr_n" -lt 30 ]; then sleep 0.01; else sleep 0.05; fi
+    _wr_n=$((_wr_n + 1))
+  done
+  if [ "$_wr_n" -ge 124 ]; then
+    kill "$_wr_pid" 2>/dev/null
+    return 1
+  fi
+  wait "$_wr_pid" 2>/dev/null
+  return $?
+}
+
+# 角色专用有界读：与 rd() 同样是"后台 cat + 有界轮询"，但**不碰断电器，也不看 usb_stuck**。
+#
+# 为什么不能用 rd()：rd() 超时会 usb_hit()（给 USB_STUCK 记一笔），被武装后又直接短路返回 1。
+# 而角色节点走的是 TCPM —— 它忙、它回滚，跟 configfs 卡死是两件不相干的事。共用的后果有两层：
+# ① 一次 TCPM 的短暂 BUSY 会被记成"USB 栈可能卡死"，真故障反而被这个假信号淹没；② 断路一旦
+# 真的被武装，assert_device_role 每次读都立刻拿不到值，守卫就永远按"角色漂移"一路重写下去，
+# 最后把本该能救回来的链路拖成 failed:usb-stuck。角色这条路径必须**任何时候都能读、能写**，
+# 它是把机器救回来的那只手。（wr_role 上面那段注释是同一个理由的写侧。）
+rd_role() {
+  _rdr_seq=$(( ${_rdr_seq:-0} + 1 ))
+  _rdr_out=$TMP/.okcar-rdrole.$$.$_rdr_seq
+  rm -f "$_rdr_out"
+  cat "$1" > "$_rdr_out" 2>/dev/null &
+  _rdr_pid=$!
+  _rdr_n=0
+  while [ "$_rdr_n" -lt 64 ]; do
+    kill -0 "$_rdr_pid" 2>/dev/null || break
+    if [ "$_rdr_n" -lt 30 ]; then sleep 0.01; else sleep 0.05; fi
+    _rdr_n=$((_rdr_n + 1))
+  done
+  if [ "$_rdr_n" -ge 64 ]; then
+    rm -f "$_rdr_out"
+    return 1
+  fi
+  wait "$_rdr_pid" 2>/dev/null
+  _rdr_rc=$?
+  cat "$_rdr_out" 2>/dev/null
+  rm -f "$_rdr_out"
+  return $_rdr_rc
+}
+
+# typec / usb_role 类节点的回读把**当前角色**放在方括号里，而**位置不固定**。
+# 217 实测（2026-10-26）：data_role -> `host [device]`，power_role -> `[source] sink`。
+# Android 框架的 UsbPort 也是只认方括号、不看位置：同一时刻 `dumpsys usb` 的
+# port_manager.status 报 data_role=device、power_role=source，正好是那两个方括号里的值。
+#
+# 所以取当前角色必须按方括号解析，不能拿整串去比。整串比较的后果不是一个日志笔误：
+# 每拍都判"没接受"-> 每 2 秒白写一次 TCPM（违背上面"稳态零写"的承诺），而且返回 3 而不是
+# 0/2，于是"角色刚掰回、本拍不判卡死"的豁免分支（_rr∈{2,4}）永远走不到——恰恰是 2.30 想
+# 避免的那个假 failed:usb-stuck 路径，在真机上一直开着（2026-10-26 装 2.30 后现场捕获）。
+# 取不到括号就退回整串：有的内核只印一个裸值（`device`），也有只印 `[device]` 的。
+role_current() {
+  _rlc=$1
+  case "$_rlc" in
+    *\[*\]*) _rlc=${_rlc#*\[}; _rlc=${_rlc%%\]*} ;;
+    *) _rlc=$(printf '%s' "$_rlc" | tr -d '[:space:]') ;;
+  esac
+  printf '%s\n' "$_rlc"
+}
+
+# 绑 UDC 专用：把"端口已被别人占着（EBUSY）"和"USB 栈卡死（open 永久阻塞）"分开。
+#
+# 两种失败都返回非零，但处置完全相反：
+#   * EBUSY —— 口已经被绑着（通常是 init 抢在前面）。**立刻**失败，没有什么可等的；正确反应
+#     是继续往下走（后面还有"重设身份再绑一次"的机会），或者干脆接受现状。
+#     2026-10-21 实测：对已绑的 UDC 再写一次，wr 在 0 秒内返回 1，断路器根本没武装。
+#   * 超时 —— open() 停在 D 态，wr 走满 5 秒上限并记断路器。这时任何重试都只是往 D 态里
+#     堆进程，必须停手。
+#
+# 判据用两个独立信号，不猜：断路器有没有被 wr 武装（超时的专用副作用），以及耗时。
+# 返回：0 成功 / 2 端口被占（可重试，也可放弃继续）/ 1 栈卡死（必须停）
+bind_udc() {
+  _bu_t0=$(date +%s 2>/dev/null || echo 0)
+  wr "$G/UDC" "$1"; _bu_rc=$?
+  [ "$_bu_rc" = "0" ] && return 0
+  _bu_t1=$(date +%s 2>/dev/null || echo 0)
+  _bu_dt=$(( _bu_t1 - _bu_t0 ))
+  if [ -f "$USB_STUCK" ] || [ "$_bu_dt" -ge 4 ]; then
+    return 1
+  fi
+  return 2
+}
+# gadget 的 UDC 值：读不通返回 "?"（未知），读到空返回 ""（确实没绑）。两者处置完全不同。
+gadget_udc() {
+  _u=$(rd "$G/UDC") || { printf '?'; return 0; }
+  printf '%s' "$_u"
+}
+
+# 收掉上一轮遗留的守卫。不靠 pid 文件可信（pid 会被复用、文件也可能是别的 boot 留下的），
+# 还要看 /proc/<pid>/cmdline 里确实是本脚本的 guard 子命令才动手。
+reap_stale_guard() {
+  [ -f "$GUARD_PID" ] || return 0
+  _sp=$(rd "$GUARD_PID")
+  case "$_sp" in
+    ''|*[!0-9]*) : ;;
+    *)
+      if [ "$_sp" != "$$" ] && [ -r "/proc/$_sp/cmdline" ]; then
+        _cl=$(tr '\0' ' ' < "/proc/$_sp/cmdline" 2>/dev/null)
+        case "$_cl" in
+          *okcar-carkit*guard*)
+            kill "$_sp" 2>/dev/null && log "旧守卫还在跑（pid $_sp）——已收掉，避免两边同时改 g1"
+            sleep 1
+            ;;
+        esac
+      fi
+      ;;
+  esac
+  rm -f "$GUARD_PID"
+}
+
+# 这台 ROM 上 configfs 挂在 /config（不是 /sys/kernel/config）；早先的做法是复用 Android 自己的
+# gadget g1 而不是自建——开发脚本就是那样。搞错并不隐晦：functionfs 随后会因 ENOENT 挂载失败，
+# 什么都枚举不出来。
+# Gadget 目录。**默认复用框架亲生的 g1**，`gadget=own` 才自建 okcar 目录。
+#
+# 为什么翻转（2026-10-18 实测，217 重置后重装模块复现）：自建 gadget 在这台 ROM 上**枚举不出来**。
+# 同样的 idVendor/idProduct/配置，`/config/usb_gadget/okcar` 绑上 UDC 后 217 侧
+# `/sys/class/udc/a600000.dwc3/state` 停在 `default`，ffs 日志只有 `bind`、没有一次 `setup`，
+# 而 lmi 侧是一整套 `new high-speed USB device number N` → `device descriptor read/64, error -71`
+# / `-110` → `Device not responding to setup address` → `unable to enumerate USB device` 之后就
+# 再也不重试（主机放弃了，于是表现为"插线没反应"）。换成一模一样的描述符、只用 g1 目录，
+# 148ms 内就 `New USB device found, idVendor=05ac, idProduct=12a8`、udc state=`configured`，
+# 整条 CarPlay（音频 50pps、视频 36fps、触摸注入）能跑通；同一天在同一根线、同一个口、同一个
+# 主机上反复复现三次。内核层面的确切原因还没定论（不是描述符、不是 PD 角色、不是主机挂起），
+# 所以这里按**可复现的结果**选 g1：能用比"看起来更干净"重要。
+#
+# 早先之所以躲开 g1（2026-10-06 23:43）：那会儿我们是**硬抢** g1 的 UDC，init 的属性 action 与
+# 属性服务共用主循环，于是被我们的绑定卡住 —— ANR dump 里 9 个 servicemanager 线程加 android.fg
+# 全卡在 __system_property_set，WDT 直接杀机。这个前提在 init_usb_silence（`sys.usb.configfs=0`）
+# 落地后就不成立了：arm 期间 init 的 USB action 全部被 gate 掉，根本不会去碰 g1。复用 g1 还要
+# 多做一件事 —— 记下框架原来的身份再还原（见 save_gadget_identity），否则交还口之后框架重建出来
+# 的 gadget 会顶着一张 Apple 的脸，车机会把它当 iPhone、ICCOA 就起不来了。
+GADGET_MODE=${OKCAR_GADGET_MODE:-}
+[ -n "$GADGET_MODE" ] || GADGET_MODE=$(sed -n 's/^gadget=//p' "$TMP/okcar-port-switches.conf" 2>/dev/null | tail -1)
+[ -n "$GADGET_MODE" ] || GADGET_MODE=g1
+G=${OKCAR_GADGET:-}
+if [ -z "$G" ] && [ "$GADGET_MODE" != "own" ]; then
+  for _c in /config/usb_gadget/g1 /sys/kernel/config/usb_gadget/g1; do
+    [ -d "$_c" ] && { G=$_c; break; }
+  done
+fi
+if [ -z "$G" ]; then
+  for _base in /config/usb_gadget /sys/kernel/config/usb_gadget; do
+    [ -d "$_base" ] || continue
+    mkdir -p "$_base/okcar" 2>/dev/null
+    [ -d "$_base/okcar" ] && { G=$_base/okcar; break; }
+  done
+fi
+FFS_MOUNT=/dev/usb-ffs/okcar
+FFS_NAME=ffs.okcar
+NCM_NAME=ncm.okcar
+NCM_IFNAME=${NCM_IFNAME:-usb0}
+CONFIG=b.6
+UDC_NAME=${OKCAR_UDC:-}
+
+log() { echo "$(date '+%F %T') $*" >> "$LOG"; echo "$*"; }
+set_state() { printf %s "$1" > "$STATE" 2>/dev/null; }
+
+# ---- 开关文件里的 wired 位 ------------------------------------------------------------
+# WebUI 的复选框直接读 $SWITCH_FILE 里的 `wired=`（app.js 的 sw.wired === 'on'）。但 start 也可能
+# 不是从那个开关进来的：命令行、开机钩子、.dev 脚本都会直接调 `okcar-carkit start full`。那种情况
+# 下文件里仍旧写着 wired=off，于是有线明明跑着、面板却显示"未启用"（2026-10-18 用户反馈）。
+# 所以 start/stop 自己把这一位写回去：只替换 wired= 那一行，其余键逐字节保留；文件不存在时不动它
+# ——默认值由 okcar-port-ctl 的 sw_init 负责建，这里凭空造一个会让别的键缺失。
+SWITCH_FILE=$TMP/okcar-port-switches.conf
+sw_note() {
+  [ -f "$SWITCH_FILE" ] || return 0
+  _want="wired=$1"
+  grep -qx "$_want" "$SWITCH_FILE" 2>/dev/null && return 0
+  _tmp=$SWITCH_FILE.$$
+  sed "s/^wired=.*/$_want/" "$SWITCH_FILE" > "$_tmp" 2>/dev/null || { rm -f "$_tmp"; return 0; }
+  grep -q "^wired=" "$_tmp" 2>/dev/null || echo "$_want" >> "$_tmp"
+  chmod 0644 "$_tmp" 2>/dev/null
+  mv -f "$_tmp" "$SWITCH_FILE" 2>/dev/null || { rm -f "$_tmp"; return 0; }
+  log "开关文件：$_want（面板与实际状态保持一致）"
+}
+
+# ---- 冻结保护（freezer pin）------------------------------------------------------------
+# 协议守护进程继承启动者的 cgroup。实测 2026-10-11 在 217：我们的 Java 守护进程（同样由 `su`/
+# WebUI 路径启动）落在 /uid_10305/pid_11863 —— KernelSU 管理器 App 自己的 cgroup，息屏后随该 App
+# 一起被冻结，`/proc/<pid>/wchan = do_freezer_trap`；主机（模拟器）因此拿不到应答，每秒重枚举
+# `read descriptors` 猛顶 USB，217 整机卡死。这里对 FFS 守护进程做同一件事：搬进 uid_0，并在原组
+# 被冻上时清掉 freeze 标志。搬不动只记录，绝不中断 start。
+CGROUP_ROOT=${OKCAR_CGROUP_ROOT:-/sys/fs/cgroup}
+CGROUP_SAFE=${OKCAR_CGROUP_SAFE:-$CGROUP_ROOT/uid_0}
+# /proc/<pid>/cgroup 给的是相对 cgroup 根的路径（/uid_0），写 cgroup.procs 要的是文件系统路径
+# （$CGROUP_ROOT/uid_0）—— 两套不能混用，否则判"已经安全"永远失败、每拍都重写并刷日志（见 okcar-linkd）。
+CGROUP_SAFE_PATH=${OKCAR_CGROUP_SAFE_PATH:-/uid_0}
+
+# $1 = pid；$2 = 当前 cgroup 路径（仅供宿主自检注入，默认从 /proc/<pid>/cgroup 读）
+pin_cgroup() {
+  _pid=${1:-}
+  [ -n "$_pid" ] || return 0
+  _cur=${2:-$(sed -n 's/^0:://p' "/proc/$_pid/cgroup" 2>/dev/null)}
+  case "$_cur" in
+    "$CGROUP_SAFE_PATH"|"$CGROUP_SAFE_PATH"/*) ;;
+    *)
+      if [ -w "$CGROUP_SAFE/cgroup.procs" ] && echo "$_pid" > "$CGROUP_SAFE/cgroup.procs" 2>/dev/null; then
+        log "freezer: moved pid $_pid: ${_cur:-unknown} -> $CGROUP_SAFE"
+      fi
+      ;;
+  esac
+  case "$_cur" in
+    ""|"/") ;;
+    *)
+      _cf="$CGROUP_ROOT$_cur/cgroup.freeze"
+      if [ -w "$_cf" ] && [ "$(cat "$_cf" 2>/dev/null)" = "1" ]; then
+        echo 0 > "$_cf" 2>/dev/null && log "freezer: cleared the freeze flag on $_cur"
+      fi
+      ;;
+  esac
+  return 0
+}
+
+daemon_bin() {
+  if [ -x "$MODDIR/system/bin/okcar-ffs-usbmux" ]; then echo "$MODDIR/system/bin/okcar-ffs-usbmux"
+  elif [ -x /system/bin/okcar-ffs-usbmux ]; then echo /system/bin/okcar-ffs-usbmux; fi
+}
+linkd_bin() {
+  if [ -x "$MODDIR/system/bin/okcar-linkd" ]; then echo "$MODDIR/system/bin/okcar-linkd"
+  elif [ -x /system/bin/okcar-linkd ]; then echo /system/bin/okcar-linkd; fi
+}
+
+# gadget 配坏可能让手机没有 USB；开发脚本为此用了自动回滚定时器。这里的守卫更简单也更严：只在
+# 守护进程写完描述符之后才绑 UDC，而 `stop` 一律把 sys.usb.config 写回 adb。
+PERM_WAS=""
+selinux_relax() { PERM_WAS=$(getenforce 2>/dev/null); [ "$PERM_WAS" = Enforcing ] && setenforce 0 2>/dev/null; }
+selinux_restore() { [ "$PERM_WAS" = Enforcing ] && setenforce 1 2>/dev/null; }
+
+unbind() { [ -w "$G/UDC" ] && wr "$G/UDC" ""; }
+
+# ---- init 静默 hook（替代"每秒硬抢 UDC"）--------------------------------------------------
+#
+# 为什么要它：init 的**所有** USB 配置动作都挂在 `sys.usb.config=<x> && sys.usb.configfs=1`
+# 之下（init.usb.configfs.rc 与 init.qcom.usb.rc 的每一条 `write /config/usb_gadget/g1/UDC`
+# 都是），而那条 action 里就有 `symlink ffs.adb` + `write g1/UDC` —— **init 才是绑 g1 的人**。
+# 所以"守卫解绑 g1 再抢"永远是自我循环：解绑本身就是 USB 状态变化，会把 init 同步请回来重绑，
+# 一秒两次、永远抢不到（2026-10-11 现场：日志几百条"已从 g1 释放/夺不回"，有线彻底起不来）。
+#
+# 正解是让 init 这段时间**闭嘴**：把 sys.usb.configfs 置 0，那批 action 全部不匹配，口就是我们的，
+# 一次绑上即稳。
+#
+# 但反向恢复必须**先松口再放行**，这是今晚把 217 搞死的教训：我们的 gadget 还占着 UDC 时把
+# configfs 恢复成 1，init 立刻触发 `write g1/UDC`，而本 ROM 的 dwc3 在
+# `usb_gadget_probe_driver` 里**不返回 EBUSY 而是永久阻塞**，于是 init（PID 1）进 D 态、
+# 属性服务瘫痪、整个 USB 子系统瘫痪（"插线无反应"），连 `reboot` 都走不通，只能 sysrq 硬重启。
+# 所以 restore 的顺序固定为：解绑我们自己的 → 写回 config → 恢复 configfs=1。
+INIT_USB_QUIET=${OKCAR_CARKIT_TMP:-/data/local/tmp}/okcar-usb-quiet
+# sys.usb.configfs 的"本值"记在这里，restore 时用它，而不是每次猜 1（别的组件也可能动过它）。
+#
+# 标记内容是 "<boot_id> <原值>"，**必须带 boot_id**：/data/local/tmp 跨重启保留，而
+# sys.usb.configfs 每次开机会回到 ROM 的默认值。旧的纯值标记曾经跨重启残留（2026-10-21 现场：
+# 文件里是 01:11 写的 "1"，早已不是这次开机的原值），restore 时就会把一个过期的值写回去。
+# 认不出本次开机就当没有标记，回退到当前 getprop。
+usb_configfs_orig() {
+  if [ -f "$INIT_USB_QUIET" ]; then
+    _q=$(cat "$INIT_USB_QUIET" 2>/dev/null)
+    if [ "${_q%% *}" = "$BOOT_ID" ]; then
+      printf %s "${_q##* }"
+      return 0
+    fi
+  fi
+  getprop sys.usb.configfs 2>/dev/null
+}
+
+# 把"原值"记下来（幂等：重复 arm 不该把已经置 0 的状态当成原值存下去）。
+init_usb_quiet_mark() {
+  [ -f "$INIT_USB_QUIET" ] && [ "$(cat "$INIT_USB_QUIET" 2>/dev/null | cut -d' ' -f1)" = "$BOOT_ID" ] && return 0
+  _cur=$(getprop sys.usb.configfs 2>/dev/null)
+  [ -n "$_cur" ] || _cur=1
+  printf '%s %s' "$BOOT_ID" "$_cur" > "$INIT_USB_QUIET" 2>/dev/null
+}
+
+init_usb_silence() {
+  init_usb_quiet_mark
+  [ "$(getprop sys.usb.configfs 2>/dev/null)" = "0" ] && return 0
+  setprop sys.usb.configfs 0 2>/dev/null
+  log "hook: sys.usb.configfs 0 —— init 的 USB action 全部静默（它才是绑 g1 的人；不再和它赛跑）"
+}
+
+# 守卫每拍调用：armed 期间 configfs 必须一直是 0。
+#
+# 为什么需要"每拍再确认"：静默只写一次是不够的。init 的 USB action 只要看到
+# `sys.usb.configfs=1` 就会去 `write g1/UDC`，而任何一次属性变化（MIUI 的 USB 服务、插拔、
+# system_server 的 usb 管理器）都可能把它改回 1 —— 那一刻 init 就会来抢 g1，我们的 gadget
+# 被解绑，有线当场断掉，而日志里只会看到"守卫又绑了一次"。
+# 2026-10-21 实测到过这个分叉：22:17 那次开机 `quiet=no (configfs=1)`，静默没生效却没人发现。
+# 每拍重写一次开销可忽略（一次 getprop），但只在**确实变回 1 时**才 setprop + 记日志，避免刷屏。
+init_usb_silence_assert() {
+  [ "$(getprop sys.usb.configfs 2>/dev/null)" = "0" ] && return 0
+  setprop sys.usb.configfs 0 2>/dev/null
+  log "hook: sys.usb.configfs 被改回 $(getprop sys.usb.configfs 2>/dev/null)——已重新静默，init 又被按住了"
+}
+
+init_usb_restore() {
+  # 顺序不能换：先让我们松口，否则 init 写 g1/UDC 会 D 态死锁（见上方注释）。
+  unbind
+  setprop sys.usb.config "${ORIG_USB_CONFIG:-adb}" 2>/dev/null
+  _want=$(usb_configfs_orig)
+  [ -n "$_want" ] || _want=1
+  setprop sys.usb.configfs "$_want" 2>/dev/null
+  rm -f "$INIT_USB_QUIET" 2>/dev/null
+  log "hook: 已放行 init（sys.usb.config=${ORIG_USB_CONFIG:-adb} configfs=$_want）——USB adb 由它自己重建"
+}
+
+# 让 dwc3 真的以 **device** 身份工作。2026-10-18 实测：217 重启后 typec/TCPM 会把控制器
+# 定成 `mode=host`（它的 preferred data role 是 host），此时 /sys/class/udc/a600000.dwc3
+# **根本不存在**，pick_udc 等满 20 拍也只会看到 dummy → failed:no-real-udc，而我们真正缺的
+# 只是"把控制器切回 peripheral"。切过去之后 UDC 立刻回来、整条链路正常枚举（实测把框架 gadget
+# 都枚举成功，state=configured）。
+# 写这个文件会阻塞（dwc3 要等 PHY 落定），所以放后台写，再轮询 UDC 是否出现。
+USB_MODE_FILE=${OKCAR_USB_MODE:-/sys/devices/platform/soc/a600000.ssusb/mode}
+ensure_device_mode() {
+  [ -e "$USB_MODE_FILE" ] || return 0
+  _cur=$(rd "$USB_MODE_FILE")
+  [ "$_cur" = "peripheral" ] && return 0
+  (echo peripheral > "$USB_MODE_FILE") >/dev/null 2>&1 &
+  _i=0
+  while [ "$_i" -lt 20 ]; do
+    # 判据必须是 **mode 真的变成 peripheral**，不是"UDC_STATE 文件存在"。
+    # UDC_STATE（/sys/class/udc/a600000.dwc3/state）在 mode=none 时**也存在**，内容只是
+    # "not attached"——拿它当成功判据等于没判：写入被 TCPM 回滚时照样报"已切到 peripheral"。
+    # 2026-10-21 实测正是如此：日志写 "none -> peripheral"，实际 mode 仍停在 none。
+    # 两个条件都要：mode 内容对得上，且真控制器已注册（没有它绑上去也是空的）。
+    if [ "$(rd "$USB_MODE_FILE")" = "peripheral" ] && [ -e "$UDC_STATE" ]; then
+      log "usb mode: $_cur -> peripheral（控制器已回到 device，UDC 已注册）"
+      return 0
+    fi
+    sleep 0.5
+    _i=$((_i + 1))
+  done
+  log "usb mode: $_cur -> peripheral 后 ${_i} 拍仍是 '$(rd "$USB_MODE_FILE")'——没切成（口被占着，或 TCPM 回滚了它）"
+  return 0
+}
+
+# 真正能让这台 ROM 的 TCPM 动起来的角色节点。2026-10-25 现场三选一实测（217 / OkCarOS）：
+#   echo device > /sys/class/typec/port0/data_role   -> data_role=[device]、UDC state=configured，
+#                                                       lmi 侧 1-1 变成 05ac:12a8 iPhone、模拟器起 CarPlay
+#   echo peripheral > .../a600000.ssusb/mode         -> 无变化（上面 ensure_device_mode 写的就是它）
+#   echo device > /sys/class/usb_role/a600000.ssusb-role-switch/role -> 无变化（那只是 TCPM 的状态回显）
+#   preferred_role 是 -r--r--r--，写不了（EACCES）
+# 结论：mode 文件只是"设备侧的意愿"，typec 的 data_role 才是推 TCPM 的那只手。两个都要写——
+# data_role 决定口的角色（没有它 UDC 根本不在 /sys/class/udc 里），mode 决定控制器的工作模式。
+# 保留 mode 回退路径，别的机型不至于因为缺 typec 节点而失去唯一的角色旋钮。
+OKCAR_TYPEC_ROLE=${OKCAR_TYPEC_ROLE:-/sys/class/typec/port0/data_role}
+_role_last=
+
+# 断言"本机是 USB 从设备（UFP）"。有线能不能起来基本就取决于这一条。
+#
+# 谁会把角色翻走：① FFS daemon 的 arm_role_swap（车机发 0x51 后的角色互换；那种情况会写 host
+# marker，守卫的 marker 分支已经让位，走不到这里）；② CC 重协商（换线/重插、对端角色切换）；
+# ③ 开机默认就是 host（见 ensure_device_mode 的注释）。②③ 都发生在我们开始守卫之后，所以
+# 只在 do_start 里写一次远远不够——必须每拍重申。
+#
+# 只在当前值 != device 时才写：守卫 2 秒一拍，稳态零写，不给 TCPM 写压力，也不刷屏。
+# "当前值"必须经 role_current 解析（方括号里才是当前角色，见该函数上方的 2026-10-26 现场），
+# 直接比整串会把 `host [device]` 判成 host——那就变成每拍白写一次，正是这条注释要避免的。
+# 读和写都走角色专用、不接断电器的 rd_role/wr_role：这条路必须"任何时候都能读、能写"，
+# 包括 USB_STUCK 已经被武装的时候（那时 rd 会直接短路，而那恰恰是最需要它工作的场景）。
+# 返回：0 已经是 device（没写）/ 2 写过且回读确认 / 3 写了但没确认（下一拍再试）/
+#       4 typec 节点不可用，已回退写 mode=peripheral / 5 两个节点都没有（记一行，不算失败）
+assert_device_role() {
+  _tn=$OKCAR_TYPEC_ROLE
+  if [ -e "$_tn" ] && [ -w "$_tn" ]; then
+    _raw=$(rd_role "$_tn")
+    _cur=$(role_current "$_raw")
+    [ "$_cur" = device ] && { _role_last=device; return 0; }
+    if wr_role "$_tn" device; then
+      _raw=$(rd_role "$_tn")
+      if [ "$(role_current "$_raw")" = device ]; then
+        [ "$_role_last" = device ] || log "ROLE: typec $_tn $_cur -> device（本机回到 USB 从设备——先站住角色，才谈得上枚举）"
+        _role_last=device
+        return 2
+      fi
+      [ "$_role_last" = drift ] || log "ROLE: typec $_tn 写了 device 但回读是 '$_raw'（解析出的当前角色是 '$(role_current "$_raw")'）——TCPM 没接受（换线/重插会重新协商，下一拍再试）"
+      _role_last=drift
+      return 3
+    fi
+    [ "$_role_last" = drift ] || log "ROLE: 写 typec $_tn 超时（TCPM 忙）——不改绑，下一拍再试"
+    _role_last=drift
+    return 3
+  fi
+  if [ -n "$USB_MODE_FILE" ] && [ -e "$USB_MODE_FILE" ]; then
+    _cur=$(role_current "$(rd_role "$USB_MODE_FILE")")
+    [ "$_cur" = peripheral ] && { _role_last=mode; return 0; }
+    wr_role "$USB_MODE_FILE" peripheral && { _role_last=mode; return 4; }
+    return 3
+  fi
+  [ "$_role_last" = none ] || log "ROLE: 没有可写的 USB 角色节点（无 $_tn 也无 $USB_MODE_FILE）——角色只能由 Android/TCPM 决定"
+  _role_last=none
+  return 5
+}
+
+pick_udc() {
+  [ -n "$UDC_NAME" ] && return 0
+  # 只有真控制器才允许绑定。/sys/class/udc 下除了真控制器，有些内核还会暴露
+  # /sys/class/udc/dummy_udc.0；绑上它 gadget 会显示"已启动"却什么都枚举不出来——2026-10-06
+  # 实测：手机在线上仍是普通安卓设备，接入的 CarPlay 主机把它当 iPhone 驱动，设备死机并循环
+  # 重启，直到拔线。真控制器可能在本钩子跑完之后才注册，所以要等它，绝不退回任何别的东西。
+  #
+  # 注意"真控制器不出现"有两种完全不同的原因，等多久也变不出来的是第二种：
+  #   ① 控制器还没注册完（本钩子跑在开机早期）——等它有意义；
+  #   ② **口被别人占着**：Android 把 sys.usb.config 切成 accessory（ICCOA 车机走 AOA）时，
+  #      内核会把 a600000.dwc3 从 /sys/class/udc 摘掉（dmesg: write .../g1/UDC none failed:
+  #      No such device），此时它根本不在列表里，等再久也不会回来。
+  # 2026-10-11 实测：217 插上 ICCOA 车机后就是这个状态，carkit 反复报 failed:no-real-udc，
+  # 而真相是"USB 口被 ICCOA 的 AOA 占着"——含糊的报错会让人以为模块坏了。所以等待期间一旦
+  # 发现口被别人拿去，立刻停下来说清楚（见 usb_port_taken_by）。
+  _tries=0
+  while [ "$_tries" -lt 20 ]; do
+    # 控制器**在列表里**不等于口是我们的：框架的 g1 正绑着它时（ICCOA 的 AOA 就是这个样子），
+    # 内核把真控制器留在 /sys/class/udc 里，只是归属别人。
+    # **但不因此拒绝**（2026-10-12 用户实测后的修正）：`switch wired on` 是用户的**明确指令**，
+    # 他要的就是"这个口给模拟器用"。ICCOA 占着口时若在这里 return 2，结果就是用户开了开关
+    # 却永远连不上、面板显示"口被占用"像模块坏了。指令优先：说清楚会中断 ICCOA，然后照常抢。
+    if _taken=$(usb_port_taken_by); then
+      log "USB 口当前被占用：$_taken"
+      log "switch wired on 是明确指令——抢过来（这会中断 ICCOA 当前的有线会话；要保留 ICCOA 请先 switch wired off）"
+    fi
+    for u in /sys/class/udc/*; do
+      [ -e "$u" ] || continue
+      case "${u##*/}" in *dummy*|*Dummy*) continue ;; esac
+      UDC_NAME=${u##*/}
+      return 0
+    done
+    # 列表里没有真控制器。若是被 ICCOA 占着（内核已把它从 /sys/class/udc 摘掉），等再久也不会
+    # 回来——直接拿默认名字往下走，由 init_usb_silence + release_port 夺回口后再绑（2026-10-12
+    # 实测：这个场景下旧代码干等 10 秒后报 failed:no-real-udc，用户开了开关却连不上）。
+    if _taken=$(usb_port_taken_by); then
+      log "USB 口被占用：$_taken（内核已把真控制器从 /sys/class/udc 摘掉）——直接夺口，不干等"
+      UDC_NAME=${OKCAR_UDC:-a600000.dwc3}
+      return 0
+    fi
+    [ "$_tries" = 0 ] && log "还没有真的 UDC 出现在 /sys/class/udc 下——继续等（dummy_udc 永不绑定）"
+    _tries=$((_tries + 1))
+    sleep 0.5
+  done
+  log "ERROR: /sys/class/udc 下只有 dummy_udc——拒绝绑定它（gadget 永远枚举不出来）"
+  return 1
+}
+
+# 口是不是已经被别人（通常是 ICCOA 车机的 AOA）拿走了？是就打印一句人能看懂的原因。
+#
+# 判据刻意只认**确定的外部占用**，不猜：sys.usb.config 里出现 accessory（AOA 配件模式，ICCOA
+# 车机互联走的就是它），或者框架的 g1 正绑着真 UDC 而我们自己没有。两者都说明这个口现在不是
+# 我们的，抢也抢不到——而且**不该去抢**：那会把车机正在用的 AOA 会话踢掉（用户可能正连着 ICCOA）。
+# 口是不是被**别的用途**占着，占着就不该抢？是就打印一句人能看懂的原因。
+#
+# 判据只有一条：`sys.usb.config` 里出现 accessory —— AOA 配件模式，ICCOA/CarLife 车机互联走的就是
+# 它。那种情况下抢口会**踢掉车机正在用的会话**，所以必须停手并说清楚。
+#
+# **不能**把"框架的 g1 绑着真 UDC"也算成被占：那正是本模块要接管的默认状态（见 GADGET_MODE 上方
+# 注释——自建模式下开机时占着 UDC 的就是框架的 g1，必须先把它释放掉我们的才能绑上）。第一版加了
+# 这条判据，结果 `switch wired on` 在普通 adb 模式下永远报 failed:port-taken、有线彻底起不来
+# （2026-10-11 现场：AOA 已退出、sys.usb.config=adb，面板仍显示"口被占用"）。判"能不能抢"和
+# 判"口现在归谁"是两件事，这里只回答前者。
+usb_port_taken_by() {
+  _cfg=$(getprop sys.usb.config 2>/dev/null)
+  case "$_cfg" in
+    *accessory*)
+      echo "sys.usb.config=$_cfg（AOA 配件模式，ICCOA/CarLife 车机互联在用）"
+      return 0
+      ;;
+  esac
+  return 1
+}
+
+# 口现在**实际**归谁（只读事实，给 status/面板看，不影响"能不能抢"的判断）。
+usb_port_owner() {
+  for _g in /config/usb_gadget/* /sys/kernel/config/usb_gadget/*; do
+    [ -d "$_g" ] || continue
+    [ "$_g" = "$G" ] && continue
+    _u=$(rd "$_g/UDC") || continue
+    [ -n "$_u" ] || continue
+    case "$_u" in *dummy*|*Dummy*) continue ;; esac
+    echo "$(basename "$_g")（id=$(rd "$_g/idVendor"):$(rd "$_g/idProduct")）"
+    return 0
+  done
+  echo ""
+}
+
+# 写 g1 的身份描述符。**全部走 wr()**，理由见 wr 的注释：这些文件在 USB 栈卡住时都会
+# 永久阻塞在 open() 上，裸 `echo >` 会把调用者（常常是 start 或 guard）一起挂在 D 态，
+# 于是"设身份"这一步自己成了把栈写死的凶手。wr 到点放弃并记断路器，调用者能拿到失败。
+setid() {
+  wr "$G/idVendor"   0x05ac        # Apple 厂商号
+  wr "$G/idProduct"  0x12a8        # iPhone 产品号
+  wr "$G/bcdDevice"  0x1004
+  wr "$G/bcdUSB"     0x0200
+  wr "$G/bDeviceClass"    0x00
+  wr "$G/bDeviceSubClass" 0x00
+  wr "$G/bDeviceProtocol" 0x00
+  wr "$G/bMaxPacketSize0" 64
+  mkdir -p "$G/strings/0x409" 2>/dev/null
+  wr "$G/strings/0x409/manufacturer" "Apple Inc."
+  wr "$G/strings/0x409/product"      "iPhone"
+  wr "$G/strings/0x409/serialnumber" "okcarlink00000001"
+}
+
+# 有线会话的 TLS 身份。daemon 在 lockdown 的 EnableSessionSSL 里要用
+# /data/local/tmp/lockdown-{cert,key}.pem。那两个文件放在 /data/local/tmp —— 恢复出厂就没了，之后
+# 每一次握手都死在 "tls: handshake r=-1 err=1 ... NO_CERTIFICATE_SET"，而日志里看不出是缺文件
+# （2026-10-18 重置 217 后实测：mux 通了、TLS server ready，然后握手失败）。模块自带一份，start 时补上。
+install_lockdown_identity() {
+  for _pair in "lockdown-cert.pem:0644" "lockdown-key.pem:0600"; do
+    _f=${_pair%%:*}
+    _m=${_pair##*:}
+    _src=$MODDIR/payload/$_f
+    [ -f "$_src" ] || { log "TLS: 模块里没有 payload/$_f——有线会在 EnableSessionSSL 阶段失败"; continue; }
+    _dst=/data/local/tmp/$_f
+    cmp -s "$_src" "$_dst" 2>/dev/null && continue
+    if cp -f "$_src" "$_dst" 2>/dev/null && chmod "$_m" "$_dst" 2>/dev/null; then
+      log "TLS: 已安装 $_f（$_m）"
+    else
+      log "TLS: 安装 $_f 失败——有线会在 EnableSessionSSL 阶段失败"
+    fi
+  done
+}
+
+# 复用框架的 g1 时，id 和字符串都是**框架的**（这台 ROM：18d1:4ee7 + Xiaomi MTP）。把它改成 Apple
+# 之后如果就这样把口交还 init，框架重建出来的 gadget 仍会顶着 05ac:12a8 —— 车机把它当 iPhone、
+# ICCOA 就永远起不来（用户切回 ICCOA 时会以为"又被模块占了"）。所以 arm 之前先存一份原值，
+# stop/reclaim 原样写回。configs 目录不用存：init 恢复后会自己重建 b.1 + ffs.adb。
+G_ID_SAVE=$TMP/okcar-g1-orig.conf
+save_gadget_identity() {
+  case "${G##*/}" in g1) ;; *) return 0 ;; esac
+  [ -f "$G_ID_SAVE" ] && return 0
+  : > "$G_ID_SAVE" 2>/dev/null || return 0
+  for _k in idVendor idProduct bcdDevice bcdUSB bDeviceClass bDeviceSubClass bDeviceProtocol; do
+    printf '%s=%s\n' "$_k" "$(rd "$G/$_k")" >> "$G_ID_SAVE"
+  done
+  for _k in manufacturer product serialnumber; do
+    printf 'string_%s=%s\n' "$_k" "$(rd "$G/strings/0x409/$_k")" >> "$G_ID_SAVE"
+  done
+  log "g1 身份已存档：$(sed -n 's/^idVendor=//p' "$G_ID_SAVE" 2>/dev/null):$(sed -n 's/^idProduct=//p' "$G_ID_SAVE" 2>/dev/null)"
+}
+
+restore_gadget_identity() {
+  case "${G##*/}" in g1) ;; *) return 0 ;; esac
+  if [ ! -f "$G_ID_SAVE" ]; then
+    # 没有存档（例如上一次 start 前就崩了）——至少把厂商/产品号退回框架的值，别把口交还成一个"iPhone"。
+    echo 0x18d1 > "$G/idVendor" 2>/dev/null
+    echo 0x4ee7 > "$G/idProduct" 2>/dev/null
+    return 0
+  fi
+  while IFS='=' read -r _k _v; do
+    [ -n "$_k" ] || continue
+    case "$_k" in
+      string_*)
+        _k=${_k#string_}
+        [ -n "$_v" ] || continue
+        mkdir -p "$G/strings/0x409" 2>/dev/null
+        printf '%s\n' "$_v" > "$G/strings/0x409/$_k" 2>/dev/null
+        ;;
+      *)
+        [ -n "$_v" ] && printf '%s\n' "$_v" > "$G/$_k" 2>/dev/null
+        ;;
+    esac
+  done < "$G_ID_SAVE"
+  rm -f "$G_ID_SAVE"
+  log "g1 身份已还原：$(rd "$G/idVendor"):$(rd "$G/idProduct")"
+}
+
+# 框架占着 g1，主机一接入就把描述符抢回去：sys.usb.config=mtp 时它会把 idVendor/idProduct 改回
+# 小米的 0x2717:0xff40，*而我们的 function 仍然链着*，于是配件看到的是一台中间人手机，它的
+# CarPlay 栈永远找不到 iPhone（2026-10-06 22:05 全新安装实测：217 自报 bound=05ac:12a8，
+# lmi 却列出 1-1 2717:ff40 cfg=6，模拟器停在 USB_DISCOVERY/WaitingForIphone）。配件侧无法
+# 修正，所以有线这侧必须守住自己的描述符：只要操作者的开关写着 on，一旦 id 偏离就重新断言
+# Apple id 并重绑。最坏约 2 秒，每次偏离都会连框架写入的值一起记进日志——那行日志就是证据。
+# ------------------------------------------------- 夺口失败：分型、说真话、受限自愈
+#
+# 现场（2026-10-26 12:23，真机 217）：模块正常跑着、wanted=on，把 g1/UDC 交还（echo "" > UDC）
+# 之后，守卫每约 3 秒写一次 UDC 全被内核立刻拒绝 —— 不是超时（wr() 的上限是 5 秒，3 秒的节奏
+# 说明这是"被拒"而不是"卡住"）—— 80 秒没恢复，而 state 一直写着 started。原因：会话进程
+# okcar-ffs-usbmux 还占着 /dev/usb-ffs/okcar/ep0..ep2，functionfs 端点没放掉时内核不让我们
+# 重新绑 UDC。能恢复的是人工那条 `okcar-port-ctl switch wired off && switch wired on` ——
+# 它先收掉会话进程再绑（实测 10 秒绑回、约 35 秒会话重建）。所以这一段做四件事：
+#   1. 分型：断路器已武装 / 写超时（栈忙）/ 内核拒绝（口另有持有者），不再一律喊"看 owner= 是谁"；
+#   2. state 说真话：夺不回就是 failed:port-held，不冒充 started（status、面板、WebUI 都照它判活）；
+#   3. 日志有上限：第 1 拍 + 每 PORT_RETRY_LOG 拍才记一行（否则每 3 秒一条刷满日志）；
+#   4. 连续 PORT_HEAL_AFTER 拍夺不回时，照人工那条路自愈一次；两次自愈至少隔 PORT_HEAL_SECS 秒
+#      （默认 300），免得自己把自己拖进死循环。
+#
+# 自愈命令可用 OKCAR_GUARD_HEAL_CMD 整个换掉（门禁靠它做无菌测试，不碰真 USB）。
+PORT_FAILS=$TMP/okcar-carkit.retake-fails      # 连续夺口失败拍数
+PORT_HEAL_AT=$TMP/okcar-carkit.heal-at         # 上次自愈时刻（epoch 秒）
+PORT_RETRY_LOG=${OKCAR_GUARD_RETRY_LOG:-5}     # 第 1 拍 + 每 N 拍记一行
+PORT_HEAL_AFTER=${OKCAR_GUARD_HEAL_AFTER:-5}   # 连续失败多少拍后自愈
+PORT_HEAL_SECS=${OKCAR_GUARD_HEAL_SECS:-300}   # 两次自愈的最小间隔（秒）
+PORT_HEAL_CMD=${OKCAR_GUARD_HEAL_CMD:-}
+# 这些值来自环境：别让一个手滑的 e=abc 把守卫带崩（set -u 下算术会直接退出）。
+case "$PORT_RETRY_LOG" in ''|*[!0-9]*) PORT_RETRY_LOG=5 ;; esac
+case "$PORT_HEAL_AFTER" in ''|*[!0-9]*) PORT_HEAL_AFTER=5 ;; esac
+case "$PORT_HEAL_SECS" in ''|*[!0-9]*) PORT_HEAL_SECS=300 ;; esac
+[ "$PORT_RETRY_LOG" -ge 1 ] 2>/dev/null || PORT_RETRY_LOG=5
+[ "$PORT_HEAL_AFTER" -ge 1 ] 2>/dev/null || PORT_HEAL_AFTER=5
+# 默认自愈 = 操作者手工那两步（off 收掉会话进程、on 重新建口）。off 会顺带把守卫自己杀掉，
+# 所以调用点必须丢到 setsid 后台，绝不能在前台等它。
+[ -n "$PORT_HEAL_CMD" ] || PORT_HEAL_CMD="\"$MODDIR/system/bin/okcar-port-ctl\" switch wired off; \"$MODDIR/system/bin/okcar-port-ctl\" switch wired on"
+
+# 口空掉时把它夺回来。返回 0 = 拿回了，1 = 没拿回（调用方继续下一拍）。
+retake_port() {
+  # 口空掉很可能正是因为角色被翻走（TCPM 回 host 时控制器从 /sys/class/udc 里消失）。
+  # 先纠正角色再夺口：否则夺回来的下一秒又被翻走，只剩无意义的反复重绑。
+  assert_device_role
+  release_port
+  _rp_rc=0
+  bind_udc "$UDC_NAME" || _rp_rc=$?
+  if [ "$_rp_rc" = 0 ]; then
+    log "PORT: the port was taken -- re-took it (id=$(rd "$G/idVendor"):$(rd "$G/idProduct"))"
+    set_state "started"
+    rm -f "$PORT_FAILS"
+    sleep 2
+    return 0
+  fi
+  # 分型：三种原因、三种说法。
+  if [ "$_rp_rc" = 1 ]; then
+    if [ -f "$USB_STUCK" ]; then
+      _rp_why="USB 栈被写卡住（断路器已武装）：configfs 写不通，等它到期再试，别硬写"
+    else
+      _rp_why="写 UDC 超时：USB 栈正忙（这一拍没写进去）"
+    fi
+  else
+    _rp_why="内核拒绝写 UDC：口另有持有者 —— 最可能是会话进程还占着 functionfs 端点 ep0..ep2，收不掉它就不会让我们重绑"
+  fi
+  _rp_n=$(cat "$PORT_FAILS" 2>/dev/null || echo 0)
+  case "$_rp_n" in ''|*[!0-9]*) _rp_n=0 ;; esac
+  _rp_n=$((_rp_n + 1))
+  printf '%s\n' "$_rp_n" > "$PORT_FAILS" 2>/dev/null
+  # 说真话：口没了就是口没了，别让 status / 面板继续读到一个 "started"。
+  set_state "failed:port-held"
+  if [ "$_rp_n" = 1 ] || [ $((_rp_n % PORT_RETRY_LOG)) = 0 ]; then
+    log "PORT: 夺不回 UDC（连续第 $_rp_n 拍）——$_rp_why"
+  fi
+  # 受限自愈：够多拍夺不回就照人工那条路重整一次，两次之间至少隔 PORT_HEAL_SECS 秒。
+  if [ "$_rp_n" -ge "$PORT_HEAL_AFTER" ]; then
+    _rp_now=$(date +%s 2>/dev/null || echo 0)
+    _rp_last=$(cat "$PORT_HEAL_AT" 2>/dev/null || echo 0)
+    case "$_rp_last" in ''|*[!0-9]*) _rp_last=0 ;; esac
+    if [ "$((_rp_now - _rp_last))" -ge "$PORT_HEAL_SECS" ]; then
+      printf '%s\n' "$_rp_now" > "$PORT_HEAL_AT" 2>/dev/null
+      log "PORT: 连续 $_rp_n 拍夺不回 —— 照人工那条路自愈一次；${PORT_HEAL_SECS}s 内不再试（命令：$PORT_HEAL_CMD）"
+      setsid sh -c "$PORT_HEAL_CMD" >> "$LOG" 2>&1 &
+    fi
+  fi
+  sleep 2
+  return 1
+}
+
+guard_descriptors() {
+  _stuck=0
+  while :; do
+    [ "$(rd "$TMP/okcar-carkit.wanted")" = "on" ] || break
+    # 0x51 之后主机是我们：口要留给车机的从设备，不能再绑回来。
+    #
+    # 判据是"标记内容合法"，不是"标记文件存在"（见 HOST_MARKER 的注释）。坏内容按垃圾清掉：
+    # 留着一个看不懂的标记只会让守卫永远不干活，而它恰好是唯一会把 gadget 绑回 UDC 的人。
+    #
+    # 而且"标记说已切主机"也要复核：角色切换会被 typec/TCPM 或内核自己回滚成 peripheral
+    # （2026-10-19 现场就是 marker 还在、mode 已经变回 peripheral、UDC=not attached，两侧都
+    # 不是主机 → 链路彻底死掉且没有任何人会发现）。所以 host 态要核对 USB_MODE_FILE 的实际值；
+    # 对不上就说明这次切换没站住，清掉标记让守卫把口收回来，而不是继续假装一切正常。
+    # pending 态只给有限耐心：切一次实测 50ms，超过 20 秒还停在 pending 就是失败了。
+    case "$(host_marker_state)" in
+      host)
+        _m=$(timeout 3 cat "$USB_MODE_FILE" 2>/dev/null)
+        if [ -n "$_m" ] && [ "$_m" != "host" ]; then
+          log "GUARD: 标记说已切 USB 主机，但控制器实际是 '$_m'——切换没站住，清掉标记收回 USB 口"
+          rm -f "$HOST_MARKER" 2>/dev/null
+        else
+          set_state "started"
+          sleep 2
+          continue
+        fi
+        ;;
+      pending)
+        _pending=$(( ${_pending:-0} + 1 ))
+        if [ "$_pending" -ge 10 ]; then
+          log "GUARD: 角色切换停在 pending 超过 20 秒——按失败处理，清掉标记收回 USB 口"
+          rm -f "$HOST_MARKER" 2>/dev/null
+          _pending=0
+        else
+          set_state "started"
+          sleep 2
+          continue
+        fi
+        ;;
+      bad)
+        log "GUARD: $HOST_MARKER 内容不认识（应为 1 或 pending）——已清掉，重新接管 USB"
+        rm -f "$HOST_MARKER" 2>/dev/null
+        ;;
+    esac
+    _pending=0
+    [ -d "$G" ] || break
+    # 静默必须在每一拍重新确认：只要 configfs 被别人改回 1，init 立刻就能来抢 g1，而那正是
+    # 下面"我们解绑、init 绑回"死循环的前提。放在卡死检测**之前**，所以不额外读一次 configfs。
+    # （init_usb_silence_assert 内部只在真的变回 1 时才 setprop + 记日志，不刷屏。）
+    init_usb_silence_assert
+    # 每拍也确认 config 里没有外来 function（init 的 f1->ffs.adb 之类）。
+    # 脏 config = 脏身份：主机看到"安卓 VID/PID + 苹果字符串"就把手机当安卓设备，模拟器认不到
+    # USBMUX，ICCOA 抢口，两边互踢。prune 只在真有外来链接时才写日志，所以不会刷屏；
+    # 已经枚举出去的脏配置要重绑才生效，那交给下面"口被拿走"或守卫正常的重绑分支。
+    prune_foreign_functions
+    # 每拍重申"本机是 USB 从设备"。为什么不是只在 start 里写一次：角色会被 CC 重协商
+    # （换线/重插、对端切换）和 TCPM 自己翻回 host —— okcar-role 为同样的理由要一直钉住。
+    # 这里在 marker 分支**之后**：host/pending 两态都 continue 了，主机方向不会被这里抢回来。
+    #
+    # 也必须放在下面"读不通就判卡死"**之前**：TCPM 翻回 host 时 UDC 会从 /sys/class/udc 消失、
+    # configfs 读会变慢，那是角色漂移而不是栈卡死。先把角色掰回来，本拍就别计进 _stuck——
+    # 否则守卫会把自己判死（写 failed:usb-stuck 后退出），而这条链路本来是能救回来的。
+    _rr=0
+    assert_device_role
+    _rr=$?
+    # 读不通（rd 非 0）≠ 没绑：USB 栈卡住时每一次 configfs 读都会超时。连续 3 拍读不通就退出，
+    # 不要再每拍开一个 cat 堆进 D 态——那只会把整机拖慢，而 USB 不会自己回来。
+    _udc=$(gadget_udc)
+    if [ "$_udc" = "?" ]; then
+      if [ "$_rr" = "2" ] || [ "$_rr" = "4" ]; then
+        _stuck=0
+        log "GUARD: configfs 这一拍读不通，但刚把角色掰回 device——按角色漂移处理，不计入卡死"
+        sleep 1
+        continue
+      fi
+      _stuck=$((_stuck + 1))
+      if [ "$_stuck" -ge 3 ]; then
+        # 分型交给 declare_usbstuck：探测读超时 = 内核 configfs 死锁（failed:usb-reboot-needed），
+        # 读得完 = 老结论 failed:usb-stuck。守卫随后退出，这条分支一次 boot 最多走一次，
+        # 所以那 ~2 秒探测不构成 D 态堆积。
+        declare_usbstuck "$_stuck"
+        break
+      fi
+      sleep 3
+      continue
+    fi
+    _stuck=0
+
+    # 0) 口被拿走了（我们的 gadget 没绑着 UDC）就夺回来。
+    #
+    # hook 之后这件事变简单了：init 已被 sys.usb.configfs=0 静默，**没有人在跟我们抢**，所以
+    # 一次解绑 + 一次绑定就够。历史留给后人：这里曾经是"每轮 release_port + 连抢 12 次"，因为
+    # 那时 init 才是绑 g1 的人，而我们解绑 g1 这一动作本身会把 init 同步请回来重绑，形成
+    # "我们解绑、init 绑回"的每秒两次死循环（2026-10-11 现场：日志几百条、有线彻底起不来）。
+    # 现在若这里还在反复触发，说明不是 init 干的 —— 看 status 的 owner= 是谁。
+    # （静默已在上面这一拍开头重新确认过，这里不再重复 setprop。）
+    if [ -z "$_udc" ]; then
+      # 口空掉就夺回来。分型、说真话（failed:port-held）、日志去重与受限自愈都在 retake_port 里；
+      # 那段注释写明了 2026-10-26 12:23 的现场与为什么"每 3 秒同一条日志"是不够的。
+      retake_port
+      continue
+    fi
+
+
+    # 1) 这里绝不碰 sys.usb.config（也不碰 svc usb）——见 start 里的注释。写那个属性正是把
+    #    init/MIUI 请来在我们脚底下重建 g1 的原因：2026-10-06 22:43 七秒内写了三次，紧接着就
+    #    触发了 system_server 的 watchdog。我们只盯自己的描述符。
+
+    # 2) 核对描述符。链路已 configured 时绝不重绑：那等于在活动会话（以及 system_server）脚下拔
+    #    USB。这时只改写 configfs，让下一次枚举生效；只有没接主机时才允许重绑。
+    v=$(rd "$G/idVendor"); p=$(rd "$G/idProduct")
+    [ -n "$v" ] || v="?"
+    [ -n "$p" ] || p="?"
+    if [ "$v" != "0x05ac" ] || [ "$p" != "0x12a8" ]; then
+      selinux_relax
+      setid
+      if [ "$(rd "$UDC_STATE")" = "configured" ]; then
+        log "GUARD: descriptors were $v:$p but the link is configured -- ids restored without a rebind"
+      else
+        log "GUARD: descriptors were $v:$p (nothing attached) -- rebinding"
+        if [ -n "$UDC_NAME" ]; then
+          unbind; sleep 1
+          wr "$G/UDC" "$UDC_NAME"
+        fi
+      fi
+      selinux_restore
+      sleep 3
+    else
+      sleep 2
+    fi
+  done
+  log "GUARD: 退出（wired 开关已关或 gadget 已消失）"
+}
+
+clear_config() {
+  for c in "$G"/configs/*/; do
+    [ -d "$c" ] || continue
+    for l in "$c"*; do [ -L "$l" ] && rm -f "$l"; done
+    rmdir "$c"strings/0x409 "$c"strings 2>/dev/null
+    rmdir "$c" 2>/dev/null
+  done
+}
+
+# 把 config 里的 function 链接清理成"只有我们自己的"。
+#
+# 为什么必须有这一步：`setid()` 只写 gadget 级描述符（idVendor/idProduct/strings），**管不到
+# config 级的 function 链接**。而 init 的 USB action（`sys.usb.configfs=1` 时生效）会在它的
+# 配置里塞 `f1 -> ffs.adb` —— 那是**安卓 adb** 的 function。只要它混进我们自认为"苹果"的
+# config，主机拿到的就是一个**脏身份**：VID/PID 可能是苹果的，但接口表里有安卓的 adb 接口。
+#
+# 2026-10-21 现场抓到的就是这种脏身份（lmi dmesg）：
+#   idVendor=18d1, idProduct=4ee7   <- 安卓 VID/PID
+#   Product: iPhone                 <- 苹果字符串
+#   Manufacturer: Apple Inc.
+# 主机侧据此判定"这不是一台干净的 iPhone"，于是按安卓设备处理 —— 手机上跑的模拟器 认不到
+# 它要的 USBMUX 接口（`could not claim USBMUX interface 1`），系统则拉起 ICCOA 来抢这个口，
+# 两边互相踢，gadget 反复 disabled/enabled。
+#
+# 所以：绑 UDC 之前，configs/*/ 下只允许出现我们两个 function 的链接，其余（f1、ffs.adb、
+# ffs.mtp、mass_storage 之类 init/框架留下的）一律删掉；config 的 iConfiguration 字符串也
+# 必须是苹果的（init 会把它写成 "adb"）。
+# 只动 config 级的链接与字符串，不碰 gadget 级描述符，也不碰 functions/ 里别人的实例
+# （动了会牵连框架自己的配置）。
+OUR_FUNCS=" $FFS_NAME $NCM_NAME "
+# 每个 config 应该显示的配置名（真 iPhone 的 iConfiguration）。
+config_label_for() {
+  case "$1" in
+    b.1) printf '%s' "Apple Mobile Device" ;;
+    *)   printf '%s' "PTP + Apple Mobile Device + Apple USB Ethernet + NCM" ;;
+  esac
+}
+prune_foreign_functions() {
+  _pf_n=0
+  _pf_l=0
+  for c in "$G"/configs/*/; do
+    [ -d "$c" ] || continue
+    _pf_cn=$(basename "$c")
+    for l in "$c"*; do
+      [ -L "$l" ] || continue
+      _pf_b=${l##*/}
+      case "$OUR_FUNCS" in
+        *" $_pf_b "*) continue ;;
+      esac
+      rm -f "$l" 2>/dev/null && { _pf_n=$((_pf_n + 1)); log "prune: 从 $_pf_cn 删掉非本模块的 function '$_pf_b'（脏身份来源）"; }
+    done
+    # 配置名也是身份的一部分：init 重建 b.1 时会把 iConfiguration 写成 "adb"，
+    # 主机读到"配置叫 adb"就不会当它是 iPhone。发现不对就改回苹果的写法。
+    _pf_s="$c/strings/0x409/configuration"
+    _pf_want=$(config_label_for "$_pf_cn")
+    if [ -d "$c/strings/0x409" ]; then
+      _pf_old=$(cat "$_pf_s" 2>/dev/null)
+      if [ "$_pf_old" != "$_pf_want" ] && wr "$_pf_s" "$_pf_want"; then
+        _pf_l=$((_pf_l + 1))
+        log "prune: 把 $_pf_cn 的配置名从 '${_pf_old:-<空>}' 改回 '$_pf_want'（脏身份来源）"
+      fi
+    fi
+  done
+  [ "$_pf_n" = "0" ] || log "prune: 共删掉 $_pf_n 条外来 function 链接"
+  [ "$_pf_l" = "0" ] || log "prune: 共修正 $_pf_l 个配置名"
+  return 0
+}
+
+# configfs 不接受 `ln -f` 的 unlink 那一半（EPERM），所以先删再链。
+# 一个 UDC 只能被一个 gadget 占用。自建模式下开机时占着它的是框架的 g1，必须先把它释放掉我们的
+# 才能绑上——旧代码正是靠复用 g1 做到这一点，只不过现在 g1 始终是框架的 gadget，它自己再也绑不
+# 上了（EBUSY，很快失败）。
+release_port() {
+  for _g in /config/usb_gadget/* /sys/kernel/config/usb_gadget/*; do
+    [ -d "$_g" ] || continue
+    [ "$_g" = "$G" ] && continue
+    _u=$(rd "$_g/UDC") || continue      # 读不通就别动它：USB 栈卡着时写也只会一起挂
+    if [ -n "$_u" ]; then
+      wr "$_g/UDC" "" && log "已从 $(basename "$_g") 释放 UDC"
+    fi
+  done
+}
+
+link_function() {
+  rm -f "$G/configs/$CONFIG/$2"
+  ln -s "$G/functions/$1" "$G/configs/$CONFIG/$2" || log "ERROR: 链接 $2 失败"
+}
+
+mount_ffs() {
+  tries=0
+  while [ ! -e "$FFS_MOUNT/ep0" ] && [ "$tries" -lt 10 ]; do
+    umount "$FFS_MOUNT" 2>/dev/null
+    mkdir -p "$FFS_MOUNT"
+    mount -t functionfs "${FFS_NAME#ffs.}" "$FFS_MOUNT" 2>&1 | sed 's/^/  mount: /' | tee -a "$LOG"
+    [ -e "$FFS_MOUNT/ep0" ] && break
+    sleep 1
+    tries=$((tries + 1))
+  done
+  [ -e "$FFS_MOUNT/ep0" ]
+}
+
+start_daemon() {
+  # 只按**进程名**收旧实例。原先的 `pkill -f okcar-ffs-usbmux` 会匹配任何命令行里含这个串的进程
+  # （实测 2026-10-11：它把调用者自己的 shell 一起杀了，于是重启那半截没执行），而且 Linux 的 comm
+  # 只保留 15 字符，`pkill -x okcar-ffs-usbmux` 又匹配不到 —— 两个都不可靠。判据改成：
+  #   1) comm 恰好是 okcar-ffs-usbmu（15 字符截断）；2) 兜底只认命令行里带 "$FFS_MOUNT/ep0" 的进程。
+  # 遗留的双实例会让两个进程抢同一个 ep0（第二个卡在 ffs_ep0_write），把整条有线链路搅坏。
+  pkill -x okcar-ffs-usbmu 2>/dev/null
+  pkill -f "$FFS_MOUNT/ep0" 2>/dev/null
+  sleep 1
+  : > "$DAEMON_LOG"
+  nohup "$(daemon_bin)" "$FFS_MOUNT/ep0" >> "$DAEMON_LOG" 2>&1 </dev/null &
+  ffs_pid=$!
+  # 冻结保护：别让它落在调用者（su/WebUI）的 App cgroup 里等着被冻（见 pin_cgroup）
+  pin_cgroup "$ffs_pid"
+  sleep 2
+  grep -q "descriptors written" "$DAEMON_LOG" || return 1
+  return 0
+}
+
+do_start() {
+  mode=${1:-full}
+  # 先脱离：本次运行即将重配 USB，而那会停掉 adbd，调用者很可能就是一个 adb shell（或正在等我
+  # 们的开机钩子）。真正干活的是脱离出去的那个子进程。
+  if [ "${OKCAR_CARKIT_DETACHED:-0}" != "1" ]; then
+    set_state "starting"
+    log "收到 start 请求（mode=$mode）——已脱离运行；观察 $STATE 和 $LOG"
+    OKCAR_CARKIT_DETACHED=1 setsid sh "$0" start "$mode" >>"$LOG" 2>&1 &
+    return 0
+  fi
+  set_state "starting"
+  rm -f "$HOST_MARKER" 2>/dev/null
+  # 用户显式 start 就是一次"再试一次"：清掉本次开机的卡死判定，让它重新探一次 configfs。
+  # 只在 start 里清 —— status 绝不能清，否则每 5 秒一次的探针又会在卡死时反复 open() 堆 D 态。
+  usb_stuck_clear
+  # 夺口计数是「上一轮」的账：一次显式 start 就是重新开始，清掉它。2026-10-26 12:23 自愈后
+  # 实测那两个文件跨 boot 一直是陈旧的 5 / 1792998186 —— 下一轮第 1 拍夺口失败时，计数从 6 起
+  # （$((6 % 5)) = 1）会整行跳过日志，还立刻就够上自愈门槛，诊断时先被骗一次。
+  # 只清 PORT_FAILS，绝不清 PORT_HEAL_AT：自愈正是靠 "switch wired on" 走到这里的，把上次自愈
+  # 时刻一起清掉等于自己拆掉限速器，off;on 会每隔十几秒拍一次 USB。
+  rm -f "$PORT_FAILS" 2>/dev/null
+  # configfs 内核死锁预检（2026-10-27 11:27 现场：start 走到 clear_config 的 rm 时停进 D 态
+  # config_usb_cfg_unlink，此后**所有** configfs 访问一起挂——上一轮 start 卡死、守卫已被它收掉、
+  # state 骗人地停在 starting，用户端就是"再插也只是 模拟器被唤醒、永远连不上"。内核死锁用户态
+  # 解不开，重试只会往 D 态里堆杀不掉的进程，所以放在**动 USB 之前**探测：读不完就直接说出
+  # 唯一可行动作，读得完才继续（哪怕读到空）。
+  configfs_probe "$G/UDC"
+  _pf=$?
+  if [ "$_pf" = "2" ]; then
+    log "ERROR: $G/UDC 读超时——USB 栈已在内核里卡死（configfs 死锁），重试救不回来；请重启手机恢复"
+    set_state "failed:usb-reboot-needed"
+    return 1
+  fi
+  [ "$(id -u)" = "0" ] || { log "需要 root"; set_state "failed:need-root"; return 1; }
+  [ -n "$G" ] && [ -d "$G" ] || { log "ERROR: 找不到 configfs gadget 目录（已找过 /config/usb_gadget/g1 与 /sys/kernel/config/usb_gadget/{g1,okcar}）；设 OKCAR_GADGET=<dir>"; set_state "failed:no-configfs"; return 1; }
+  bin=$(daemon_bin)
+  [ -n "$bin" ] || { log "ERROR: 模块 payload 里找不到 okcar-ffs-usbmux"; set_state "failed:no-daemon"; return 1; }
+  # 上一轮的守卫必须先收掉再动 USB。2026-10-18 23:29 的事故：start 的时候旧守卫还活着，它和我们
+  # 同时写 g1 —— 我们写的 05ac:12a8 被它按框架身份盖成 18d1:4ee7，绑上去的是"Apple 配置 + 小米身份"
+  # 的混合体，主机枚举失败；接着两边互相重绑把 dwc3 卡死，守卫本身又每拍开一个 cat 卡在 D 态，
+  # load average 冲到 6+，只能重启手机。
+  reap_stale_guard
+  # 控制器可能还停在 host（开机默认，见 ensure_device_mode 的注释）——先把它掰回 device，
+  # 否则下面 pick_udc 连 UDC 都看不到。
+  #
+  # 顺序：**先断言 typec 的角色，再写 mode**。2026-10-25 现场：单靠 ensure_device_mode 在这台
+  # ROM 上完全无效——TCPM 不理会设备侧的意愿，mode 写成 peripheral、UDC 仍是 not attached；
+  # 只有 data_role=device 才真的把口切成从设备。roles 站不住，pick_udc 只会看到 dummy。
+  assert_device_role
+  ensure_device_mode
+  # 复核一次。ensure_device_mode 会等 mode 与 UDC 同时到位，但角色若在这一小段里被 TCPM 回滚，
+  # 它只会记一行"没切成"然后 return 0（见它自己的注释），不会失败。这里再确认一次；返回值不
+  # 参与分支——pick_udc 会给最终答案。
+  assert_device_role
+  # pick_udc 只可能返回 0（拿到控制器名，含"口被 ICCOA 占着时直接夺口"）或 1（等满 20 拍仍只有
+  # dummy）。2026-10-12 修正：不再有"检测到占用就拒绝"的分支——`switch wired on` 是用户明确指令，
+  # 抢之前说清楚会中断 ICCOA，但指令优先（旧逻辑让用户开了开关却永远 failed:port-taken）。
+  if ! pick_udc; then
+    log "ERROR: /sys/class/udc 下没有真的 UDC——没有可绑的对象"
+    set_state "failed:no-real-udc"
+    return 1
+  fi
+
+  log "start mode=$mode udc=$UDC_NAME gadget=$G"
+  selinux_relax
+  # 在碰 USB 状态机之前先把 TCP adb 备好：`setprop sys.usb.config none` 会让 init 停掉 adbd，
+  # 之后再想把它弄回来正是全新 217 安装上失败的地方（state failed:no-adb-path，2026-10-06
+  # 21:36）——当时的守卫跑在 selinux_restore 之后，于是 `start adbd` 被拒。
+  setprop service.adb.tcp.port 5555 2>/dev/null
+  start adbd 2>/dev/null
+  # 取口的方式：**先让 init 闭嘴，再解绑**（顺序很重要）——见 init_usb_silence 的注释。
+  # 旧版这里是"解绑 g1 → 立刻绑"，靠连抢碰运气，一秒输两次；hook 之后不需要抢。
+  ORIG_USB_CONFIG=$(getprop sys.usb.config 2>/dev/null)
+  init_usb_silence
+  # init 已闭嘴、g1 还没被我们改脏 —— 此刻存下框架的身份，stop 时才能原样还回去。
+  save_gadget_identity
+  log "taking the port: init is silenced, then unbinding the UDC (sys.usb.config left at '$ORIG_USB_CONFIG')"
+  release_port
+  sleep 1
+  unbind
+  clear_config
+  # 留一条回来的路：重配 USB 栈时这台 ROM 会停掉 adbd。注意我们不是自己去停 adbd——从 adb
+  # shell 里停它正是杀死本脚本的原因（见头部说明）。
+  setprop service.adb.tcp.port 5555 2>/dev/null
+
+  setid
+  mkdir -p "$G/configs/$CONFIG"
+  echo 500  > "$G/configs/$CONFIG/MaxPower"
+  echo 0xc0 > "$G/configs/$CONFIG/bmAttributes"
+  mkdir -p "$G/configs/$CONFIG/strings/0x409"
+  echo "PTP + Apple Mobile Device + Apple USB Ethernet + NCM" > "$G/configs/$CONFIG/strings/0x409/configuration"
+
+  # 双配置：config 1 只暴露 USBMUX，config 6 是完整 CarPlay（USBMUX+NCM）。真 iPhone 就是这样：
+  # CarPlay 主机（模拟器/车机）先用 **config 1** 完成枚举和 USBMUX 握手，之后自己切到 config 6
+  # 拿 NCM。只有 b.6 时主机第一步就失败——实测 2026-10-12：lmi 反复
+  # "Device not responding to setup address"（-71），一条 ffs setup 都进不来；同一台机器上
+  # .dev/d217-gadget-apple.sh（DUAL_CONFIG=1）稳定 30fps。没有 config 1 还会踩
+  # "usbfs: interface claimed by cdc_ncm while ... sets config #6"（主机把端点配到一半）。
+  if [ "$mode" = full ]; then
+    mkdir -p "$G/configs/b.1/strings/0x409"
+    echo 500  > "$G/configs/b.1/MaxPower"
+    echo 0xc0 > "$G/configs/b.1/bmAttributes"
+    echo "Apple Mobile Device" > "$G/configs/b.1/strings/0x409/configuration"
+  fi
+  # 2026-10-19：a production head unit (x86 Android 9)在 config 1 上完成 0x53 能力协商、发出 0x51 之后
+  # 立刻重枚举（ffs 反复 disabled/enabled），一轮约 1 秒，始终不切到 config 6，因此永远拿不到
+  # NCM：车机侧 usbncm0 一直 NO-CARRIER，CarPlay 停在 mDNS 之前。真 iPhone 的 CarPlay 配置里
+  # 本来就是 mux+NCM 同时存在，所以让 config 1 也带上 NCM，车机不必换配置就能起网卡。
+  # 开关 OKCAR_NCM_IN_CONFIG1=0 可退回"config 1 只有 mux"的旧行为。
+
+
+  install_lockdown_identity
+  if [ "$mode" = full ]; then
+    mkdir -p "$G/functions/$FFS_NAME"
+    if mount_ffs && start_daemon; then
+      link_function "$FFS_NAME" "$FFS_NAME"
+      # config 1 里也要有 USBMUX，主机第一步枚举用的就是它（见上面的双配置注释）。
+      rm -f "$G/configs/b.1/$FFS_NAME"
+      ln -s "$G/functions/$FFS_NAME" "$G/configs/b.1/$FFS_NAME" 2>/dev/null
+    else
+      log "ERROR: functionfs/守护进程没起来——不绑 UDC（USB 留给 Android）"
+      setprop sys.usb.config adb 2>/dev/null
+      selinux_restore
+      set_state "failed:no-functionfs"
+      return 1
+    fi
+  fi
+
+  mkdir -p "$G/functions/$NCM_NAME"
+  echo "$NCM_IFNAME" > "$G/functions/$NCM_NAME/ifname" 2>/dev/null
+  link_function "$NCM_NAME" "$NCM_NAME"
+  # 见上面双配置注释末尾：让 config 1 也带 NCM，车机不换配置就能起 usbncm0。
+  if [ "$mode" = full ] && [ "${OKCAR_NCM_IN_CONFIG1:-1}" = 1 ]; then
+    rm -f "$G/configs/b.1/$NCM_NAME"
+    ln -s "$G/functions/$NCM_NAME" "$G/configs/b.1/$NCM_NAME" 2>/dev/null \
+      || log "WARN: 没能把 $NCM_NAME 链进 config 1"
+  fi
+
+  # 绑 UDC。init 已被 hook 静默，所以这里**不该再靠抢**：一次就该成。仍留几次重试是为了容忍
+  # 内核解绑的异步收尾（release_port 刚走），而不是为了和 init 赛跑。
+  #
+  # 历史（保留给后人）：这里曾经是"每轮先 release_port 再绑"，8 次全输并让守卫每秒重试两次、
+  # 日志几百条——因为解绑 g1 会把 init 同步请回来重绑（2026-10-11 现场）。hook 之后那个循环
+  # 不再需要；如果再看到"夺不回 UDC"，说明不是 init 在抢，而是口真有别的持有者（看 port=owner）。
+  #
+  # 2026-10-21：这里原来写的是裸 `echo "$UDC_NAME" > "$G/UDC"`，**绕过了 wr() 的超时保护**。
+  # 绑 UDC 恰恰是整个脚本里最容易把 dwc3 写进阻塞的那一次（它要等 PHY 落定），栈一卡，
+  # 这行就带着 `start` 一起挂住，直到天荒地老 —— 之后所有 rd 都超时返回空，身份核对于是
+  # 报出一条与事实无关的 "身份仍是 :"，把一次 USB 栈卡死伪装成"身份被别人覆盖"。
+  # 必须走 wr()：它把写丢给后台子进程、到点放弃、并记断路器。
+  #
+  # 绑之前最后确认一次 config 干净：从 clear_config 到这里，中间做过 mount_ffs/起 daemon/链
+  # function，任何一步都可能让 init 插进来重建它的 b.1（带 f1->ffs.adb）。脏身份一旦枚举出去，
+  # 主机就会把手机当安卓设备，ICCOA 起来抢口，模拟器认不到 USBMUX —— 见 prune 函数的注释。
+  prune_foreign_functions
+  _bind_try=0
+  _bound=0
+  while [ "$_bind_try" -lt 8 ]; do
+    _bind_try=$((_bind_try + 1))
+    bind_udc "$UDC_NAME"; _b_rc=$?
+    if [ "$_b_rc" = "0" ]; then
+      _bound=1
+      log "bound=$(rd "$G/UDC") id=$(rd "$G/idVendor"):$(rd "$G/idProduct") config=$CONFIG (attempt $_bind_try)"
+      break
+    fi
+    if [ "$_b_rc" = "1" ]; then
+      # 走满 5 秒 = 栈真的卡住了。再试只会往 D 态里堆进程，立即停手。
+      log "ERROR: 绑 UDC 超时（5 秒写不进去）——USB 栈卡住了，不是身份问题；重启手机恢复"
+      set_state "failed:usb-stuck"
+      selinux_restore
+      return 1
+    fi
+    # rc=2：端口已被占（EBUSY）。这在开机自启时很常见——init 可能在我们静默它之前就把
+    # g1 绑上了。**不要在这里放弃**：继续往下走，后面的身份核对与"重设身份再绑一次"
+    # 有机会把它拿回来。2026-10-21 的回归就是在这里提前 return，把整条恢复路径跳过了。
+    log "bind attempt $_bind_try 未成（端口已绑着，EBUSY）-- 继续（后面还有一次重设身份的机会）"
+    sleep 0.3
+  done
+  if [ "$_bound" != "1" ]; then
+    log "WARN: 8 次都没绑上，口可能仍被 init 占着——继续走身份核对，看能不能拿回来"
+  fi
+  # 核对绑上后的身份。**读不通 ≠ 身份错了**，这两件事必须分开。
+  #
+  # 2026-10-21 现场：绑上后 id=0x18d1:0x4ee7（init 覆盖了 setid），于是走"重设并重绑"分支；
+  # 那次 unbind + 写 UDC 在 USB 栈上阻塞，紧接着 `rd idVendor` 超时返回**空**，代码把它当成
+  # "身份是 :"，判 failed:identity —— 而实际上此刻 idVendor 读得通、值就是 0x05ac，只是 UDC
+  # 那个文件卡住了。结果是一条假的失败状态：面板显示 failed:identity，而有线其实差一步就能起。
+  #
+  # 所以：读失败（rd 非 0）就明说"读不通"，不冒充"身份错"；而且**不要**因为读不通就去重绑 ——
+  # 重绑正是把栈写进 D 态的那个动作，越救越死。
+  _vid=$(rd "$G/idVendor"); _vr=$?
+  _pid=$(rd "$G/idProduct"); _pr=$?
+  if [ "$_vr" != "0" ] || [ "$_pr" != "0" ]; then
+    log "ERROR: 绑上后读不到身份（idVendor rc=$_vr idProduct rc=$_pr）——USB 栈被写卡住了，不是身份错；不要重绑，重启手机恢复"
+    set_state "failed:usb-stuck"
+    selinux_restore
+    return 1
+  fi
+  if [ "$_vid" = "0x05ac" ] && [ "$_pid" = "0x12a8" ]; then
+    log "identity ok: $_vid:$_pid"
+  else
+    # 说明书写"先写描述符再绑 UDC"，但凡是别人也能写 g1 的时刻，我们的 setid 就可能被覆盖
+    # （2026-10-18 23:29：绑上后 id=0x18d1:0x4ee7）。身份错了主机就把我们当 Android 配件，
+    # 永远等不到 CarPlay 握手——错一次就重设再绑一次，还错就报出来。
+    log "WARNING: 绑上后身份是 $_vid:$_pid（应为 0x05ac:0x12a8）—— 有人覆盖了 setid，重设并重绑一次"
+    selinux_relax
+    setid
+    unbind; sleep 1
+    wr "$G/UDC" "$UDC_NAME"
+    _vid=$(rd "$G/idVendor"); _vr=$?
+    _pid=$(rd "$G/idProduct"); _pr=$?
+    if [ "$_vr" != "0" ] || [ "$_pr" != "0" ]; then
+      log "ERROR: 重绑后读不到身份（rc=$_vr/$_pr）——USB 栈被写卡住了；不要继续重绑，重启手机恢复"
+      set_state "failed:usb-stuck"
+      selinux_restore
+      return 1
+    fi
+    if [ "$_vid" = "0x05ac" ] && [ "$_pid" = "0x12a8" ]; then
+      log "identity restored: $_vid:$_pid"
+    else
+      log "ERROR: 身份仍是 $_vid:$_pid —— 有别的进程在写 $G；先 switch wired off 再 on"
+      set_state "failed:identity"
+      selinux_restore
+      return 1
+    fi
+  fi
+  if [ -z "$(rd "$G/UDC")" ]; then
+    log "ERROR: bind failed after $_bind_try attempts: $(rd "$TMP/bind.err") -- 口不是被 init 抢的（它已静默）；看 port=owner 是谁"
+    selinux_restore
+    init_usb_restore
+    set_state "failed:bind"
+    return 1
+  fi
+  # SELinux 保持放宽，直到下面的 adb 守卫跑完（enforcing 时 `start adbd` 会被拒）。
+
+  l=$(linkd_bin)
+  if [ -n "$l" ]; then
+    "$l" send carkit on >/dev/null 2>&1
+    log "java: $("$l" send carkit status 2>&1 | tail -1)"
+  else
+    log "WARNING: 找不到 okcar-linkd——守护进程会把服务端口中转到没人监听的 socket 上"
+  fi
+
+  # 留一条回来的路。2026-10-06 实测：sys.usb.config=none 会让 init 停掉 adbd，而本 gadget 也
+  # 没有 adb 接口，手机可能落得一条 adb 通道都没有（USB 和 TCP 都没有）。现在 USB 状态已经稳定，
+  # 重新断言 TCP adb 并*证明* adbd 在跑；如果没跑，把整套回滚——一个能把设备变成进不去的开关，
+  # 必须失败关闭。（persist.adb.tcp.port 不算证据：它只在下次开机起作用。）
+  if [ "${OKCAR_CARKIT_NO_ADB_GUARD:-0}" != "1" ]; then
+    _tries=0
+    while [ -z "$(pidof adbd)" ] && [ "$_tries" -lt 10 ]; do
+      setprop service.adb.tcp.port 5555 2>/dev/null
+      start adbd 2>/dev/null
+      sleep 1
+      _tries=$((_tries + 1))
+    done
+    if [ -n "$(pidof adbd)" ]; then
+      log "adb path: adbd=$(pidof adbd) tcp-port=$(getprop service.adb.tcp.port) persist=$(getprop persist.adb.tcp.port) retries=$_tries"
+    elif [ "$(getprop persist.okcar.wired_allow_no_adb)" = "1" ]; then
+      log "WARNING: adbd 没在跑；因为 persist.okcar.wired_allow_no_adb=1 而继续"
+    elif command -v ss >/dev/null 2>&1 && ss -tln 2>/dev/null | grep -q ':22 '; then
+      log "WARNING: adbd 没在跑；因为有另一个 shell 在 :22 上监听而继续"
+    else
+      log "ERROR: adbd 没在跑，也没有别的进入方式——回滚"
+      log "  在 :22 上有监听 shell，或 setprop persist.okcar.wired_allow_no_adb 1，即可放行"
+      do_stop
+      set_state "failed:no-adb-path"
+      return 1
+    fi
+  fi
+  selinux_restore
+  set_state "started"
+  log "done: functions=$(ls "$G/configs/$CONFIG" | tr '\n' ' ')"
+
+  # AirPlay 拨号需要 NCM 链路上有一个源地址，而 gadget 重新枚举或框架重新应用 USB 配置时，那条
+  # link-local 会抖：Java 客户端随后报 "failed to connect ... from /:: (port 0)" 且解析不出
+  # scope id（2026-10-06 23:17-23:21 实测，/proc/net/if_inet6 时而列出 usb0 时而不列）。如果有
+  # 什么东西把它关了就先打开 IPv6，然后等地址回来并写明拿到了什么。
+  if [ -f "/proc/sys/net/ipv6/conf/$NCM_IFNAME/disable_ipv6" ] \
+     && [ "$(cat "/proc/sys/net/ipv6/conf/$NCM_IFNAME/disable_ipv6" 2>/dev/null)" = "1" ]; then
+    echo 0 > "/proc/sys/net/ipv6/conf/$NCM_IFNAME/disable_ipv6" 2>/dev/null \
+      && log "已在 $NCM_IFNAME 上打开 IPv6"
+  fi
+  _nl=0
+  while [ "$_nl" -lt 20 ]; do
+    if /system/bin/ip -6 addr show dev "$NCM_IFNAME" 2>/dev/null | grep -q 'inet6 fe80'; then
+      log "ncm link ready: $(/system/bin/ip -6 addr show dev "$NCM_IFNAME" 2>/dev/null | grep -m1 inet6 | tr -s ' ')"
+      break
+    fi
+    sleep 0.5
+    _nl=$((_nl + 1))
+  done
+  if [ "$_nl" = "20" ]; then
+    # 没有任何东西给它分配地址：没有地址 AirPlay 拨号就没有源地址，所以给这条链路补一个。
+    # 只用 link-local，并且从网卡名派生，这样同一链路上的两台手机不会撞地址。
+    if /system/bin/ip -6 addr add fe80::1/64 dev "$NCM_IFNAME" scope link 2>/dev/null; then
+      log "内核没给 link-local——已在 $NCM_IFNAME 上补加 fe80::1/64"
+    else
+      log "WARNING: $NCM_IFNAME has no link-local IPv6 after 10s and adding fe80::1/64 failed -- the AirPlay dial will have no source address"
+    fi
+  fi
+  if [ "${OKCAR_CARKIT_NO_GUARD:-0}" != "1" ]; then
+    setsid sh "$0" guard >>"$LOG" 2>&1 &
+    echo $! > "$GUARD_PID" 2>/dev/null
+    log "描述符守卫已启动（pid $(cat "$GUARD_PID" 2>/dev/null)）"
+  fi
+  sw_note on
+  return 0
+}
+
+do_stop() {
+  # 先探后拆：stop 的后半段全是 configfs 写（unbind、clear_config 的 rm），在内核死锁的栈上
+  # 它们会把自己也停进 D 态——11:27 那个 rm 就是这么卡的。探测读不完就什么也别碰：杀守护
+  # 进程救不回 USB，重启才是唯一路径，留着它们等重启收。
+  configfs_probe "$G/UDC"
+  _pf=$?
+  if [ "$_pf" = "2" ]; then
+    log "ERROR: $G/UDC 读超时——USB 栈已在内核里卡死（configfs 死锁），stop 放弃拆解；请重启手机恢复"
+    set_state "failed:usb-reboot-needed"
+    return 1
+  fi
+  if [ -f "$GUARD_PID" ]; then
+    kill "$(cat "$GUARD_PID" 2>/dev/null)" 2>/dev/null
+    rm -f "$GUARD_PID"
+  fi
+  l=$(linkd_bin)
+  [ -n "$l" ] && "$l" send carkit off >/dev/null 2>&1
+  rm -f "$HOST_MARKER" 2>/dev/null
+  # stop 之后用户往往就是 switch wired off/on 再来一次，所以也清掉卡死判定。
+  usb_stuck_clear
+  log "stop"
+  selinux_relax
+  # 与 start_daemon 同一判据：按 comm（15 字符截断）或命令行里的 ep0 参数收，别用
+  # `pkill -f okcar-ffs-usbmux` —— 它会连调用者自己的 shell 一起杀（2026-10-11 实测）。
+  pkill -x okcar-ffs-usbmu 2>/dev/null
+  pkill -f "$FFS_MOUNT/ep0" 2>/dev/null
+  unbind
+  umount "$FFS_MOUNT" 2>/dev/null
+  clear_config
+  rmdir "$G/functions/$NCM_NAME" "$G/functions/$FFS_NAME" 2>/dev/null
+  # 把口交还 Android：恢复 id，然后**用 hook 按正确顺序放行 init**（先解绑再恢复 configfs=1；
+  # 顺序反了 init 会 D 态死锁，见 init_usb_restore）。init 恢复后会主动执行
+  # `symlink ffs.adb + write g1/UDC`，所以 USB adb 是**它自己重建**的 —— 这顺带修掉了旧的
+  # `stopped-usb-reboot-needed`：以前我们只写 sys.usb.config 就指望厂商 USB 层重建，它并不会。
+  restore_gadget_identity
+  sleep 1
+  init_usb_restore
+  sleep 4
+  selinux_restore
+  # 验证要看**任一个 gadget** 是否绑上了 UDC（init 重建 g1 就是成功），而不是只看我们自己的
+  # `$G/UDC` —— 那是空的（我们刚交还了），照它判会永远误报 stopped-usb-reboot-needed，
+  # 即使 USB 已经完全恢复（2026-10-12 实测：g1=[a600000.dwc3] 却报"没有重新枚举"）。
+  _bound=""
+  for _g in /config/usb_gadget/* /sys/kernel/config/usb_gadget/*; do
+    [ -d "$_g" ] || continue
+    _u=$(rd "$_g/UDC") || { _bound="?=读不通"; break; }
+    [ -n "$_u" ] || continue
+    case "$_u" in *dummy*|*Dummy*) continue ;; esac
+    _bound="$(basename "$_g")=$_u"
+    break
+  done
+  if [ "$_bound" = "?=读不通" ]; then
+    set_state "stopped-usb-stuck"
+    log "WARNING: configfs 读不通（USB 栈卡住）——stop 没能确认 init 是否重建；重启手机恢复"
+  elif [ -z "$_bound" ]; then
+    set_state "stopped-usb-reboot-needed"
+    log "WARNING: 没有 gadget 绑回 UDC（init 可能没收到 ffs.ready）。TCP/SSH 上的 adb 仍可用；重启即可恢复 USB。"
+  else
+    set_state "stopped"
+    log "hook: init 已把 USB 重建回来（$_bound）——不需要重启"
+  fi
+  log "restored: sys.usb.config=$(getprop sys.usb.config) configfs=$(getprop sys.usb.configfs) bound=$_bound"
+  sw_note off
+}
+
+# USB 栈卡死时 status 的结论段。两个 stuck 分支（断路器已武装 / 这次探测刚超时）共用。
+#
+# 它必须**照样吐出 fact= / port= / owner=**，哪怕这三样都是"未知"。踩过：2026-10-21 第一版
+# 在断路器分支里提前 return，把这三行整个省掉了 —— 面板的 wire_* 全变成空串，继电器判据
+# （wire_port 里有没有 taken）随之失效，而这三行正是 panel 判断"有线到底怎么了"的唯一依据。
+# 卡死时**最需要**这三行，不是最不需要。
+#
+# 能给的给：port 只靠 getprop，不碰 configfs，卡死时依然准确；fact/owner 必须读 configfs，
+# 只能如实报 ?（未知）。把"读不到"报成 apple=none 会骗人说"没有野 gadget"。
+stuck_report() {
+  echo "usb=stuck (configfs 读不通：USB 栈已卡住，需要重启手机)"
+  echo "id=? sys.usb.config=$(getprop sys.usb.config)"
+  if _taken=$(usb_port_taken_by); then
+    echo "port=taken: $_taken"
+  else
+    echo "port=free"
+  fi
+  echo "fact=apple=? udc=? stray=? (configfs 读不通)"
+  echo "owner=? (configfs 读不通)"
+  echo "日志尾部："; tail -4 "$LOG" 2>/dev/null | sed 's/^/  /'
+}
+
+do_status() {
+  echo "module=$(sed -n 's/^id=//p' "$MODDIR/module.prop" 2>/dev/null | head -1)"
+  echo "gadget=${G:-<未找到>}"
+  _st=$(cat "$STATE" 2>/dev/null || echo stopped)
+  echo "state=$_st"
+  # configfs 内核死锁是终局判定：这个状态是探测确认过的（读 UDC 永不返回）。到这里还去读
+  # configfs 只会再留一个 D 态进程、调用方还要白等 ~2 秒——WebUI 每 5 秒问三次。所以直接
+  # 给结论并跳过所有 configfs 读；fact/port/owner 三键照卡死报告的教训仍然要给（都是 ?）。
+  if [ "$_st" = "failed:usb-reboot-needed" ]; then
+    echo "usb=configfs-dead (内核 configfs 死锁——读 UDC 永不返回；用户态解不开，需要重启手机恢复)"
+    echo "id=? sys.usb.config=$(getprop sys.usb.config 2>/dev/null)"
+    if _taken=$(usb_port_taken_by); then
+      echo "port=taken: $_taken"
+    else
+      echo "port=free"
+    fi
+    echo "fact=apple=? udc=? stray=? (configfs 读不通)"
+    echo "owner=? (configfs 读不通)"
+    echo "日志尾部："; tail -4 "$LOG" 2>/dev/null | sed 's/^/  /'
+    return 0
+  fi
+  # configfs 读会阻塞：USB 栈卡住时 status 本身会挂住，而调用它的正是需要知道"卡住了"的人。
+  # 断路器已经判定过卡死就直接给结论，绝不再去 open() 一次（2026-10-21：每次 open 都会留一个
+  # 杀不掉的 D 态进程，而 WebUI 每 5 秒就要问一次）。
+  if usb_stuck; then
+    stuck_report
+    return 0
+  fi
+  if ! _u=$(rd "$G/UDC"); then
+    stuck_report
+    return 0
+  fi
+  echo "udc=$_u available=$(ls /sys/class/udc 2>/dev/null | tr '\n' ' ')"
+  # 标记的三种状态要分开报：坏标记是"守卫已经不干活了"，把它报成 usb=host 就是在骗人
+  # （2026-10-19 现场：坏标记 + state=started，面板显示已启动，实际 gadget 根本没绑 UDC）。
+  case "$(host_marker_state)" in
+    host)    echo "usb=host (车机发过 0x51，已切换成 USB 主机；车机的从设备应出现在 bus 上)" ;;
+    pending) echo "usb=host-pending (正在切 USB 主机，还没确认；若一直停在这里，看 ffs 日志的 role swap 结果)" ;;
+    bad)     echo "usb=host-marker-bad ($HOST_MARKER 内容损坏；守卫会在下一拍清掉它并重新接管 USB，或手动 switch wired off 再 on)" ;;
+  esac
+  echo "id=$(rd "$G/idVendor"):$(rd "$G/idProduct") sys.usb.config=$(getprop sys.usb.config)"
+  echo "functions=$(ls "$G/functions" 2>/dev/null | tr '\n' ' ')"
+  echo "ffs 挂载：$(ls "$FFS_MOUNT" 2>/dev/null | tr '\n' ' ')"
+  echo "守护进程 pid: $(pidof okcar-ffs-usbmux)"
+  echo "fact=$(apple_gadget_fact)"
+  # 两件事分开报：port 回答"现在能不能抢"（accessory 模式下不能），owner 回答"口现在归谁"。
+  # 只报一个会让面板把"框架 g1 占着（正常、可接管）"误读成"被别的功能占着"（2026-10-11 实测）。
+  if _taken=$(usb_port_taken_by); then
+    echo "port=taken: $_taken"
+  else
+    echo "port=free"
+  fi
+  _owner=$(usb_port_owner)
+  echo "owner=${_owner:-none}"
+  # hook 是否生效：quiet=yes 表示 init 的 USB action 正被静默（有线独占这个口）。
+  # 面板/现场看到"开关开着但 USB adb 不通"时，先看这一行，而不是去反复重建 gadget。
+  _cf=$(getprop sys.usb.configfs 2>/dev/null)
+  if [ "$_cf" = "0" ]; then
+    echo "quiet=yes (configfs=0, init 已静默; 原值=$(usb_configfs_orig))"
+  else
+    echo "quiet=no (configfs=$_cf)"
+  fi
+  l=$(linkd_bin); [ -n "$l" ] && echo "java: $("$l" send carkit status 2>&1 | tail -1)"
+  echo "日志尾部："; tail -4 "$LOG" 2>/dev/null | sed 's/^/  /'
+}
+
+# 有线模式的**事实**，与开关文件里的"意图"分开报。
+#
+# 为什么需要它：开关文件记的是"用户想不想要"，而 USB 上真正在跑的是某个 gadget。两者会分叉 ——
+# 实测 2026-10-11：为了排障用 .dev 脚本直接改了**框架的 g1**（那个脚本不写开关文件），于是
+# `wired=off` 而 g1 上挂着 05ac:12a8 + ffs.okcar + ncm.okcar 且已绑 UDC，有线真的能连，WebUI
+# 却显示"关闭"。面板只看开关，就永远看不到这个野 gadget。
+#
+# 判据刻意**不要求 UDC 已绑**：只带 Apple ID 而暂时没绑的 g1 更危险 —— 框架下一次应用
+# sys.usb.config 时会把它绑上去，手机就"无缘无故"以 iPhone 枚举（有线的野状态又回来了）。
+# 所以事实里同时给出有没有绑（udc=yes|no），让"清理"和"它正在服务"两件事都看得见。
+# 这里只**读**事实，不改任何东西：
+#   apple=<gadget 目录> udc=yes|no —— 哪个 gadget 现在自称 Apple（空 = 没有）
+#   stray=yes|no                  —— 该 gadget 是不是不是我们自己的那个（G），即有"没人管"的野 gadget
+apple_gadget_fact() {
+  _hit=
+  for _g in /config/usb_gadget/* /sys/kernel/config/usb_gadget/*; do
+    [ -d "$_g" ] || continue
+    _v=$(rd "$_g/idVendor") || { echo "apple=? udc=? stray=? (configfs 读不通)"; return 0; }
+    [ "$_v" = "0x05ac" ] || continue
+    [ "$(rd "$_g/idProduct")" = "0x12a8" ] || continue
+    _hit=$_g
+    break
+  done
+  [ -n "$_hit" ] || { echo "apple=none"; return 0; }
+  # 读不通就报"未知"，别报 udc=no：USB 栈卡住时这一读会超时，而 status 正被用来判断"是不是卡住了"。
+  if ! _raw=$(rd "$_hit/UDC"); then
+    echo "apple=$_hit udc=? stray=$([ "$_hit" = "$G" ] && echo no || echo yes)"
+    return 0
+  fi
+  if [ -n "$_raw" ]; then _udc=yes; else _udc=no; fi
+  case "$_hit" in
+    "$G") echo "apple=$_hit udc=$_udc stray=no" ;;
+    *)    echo "apple=$_hit udc=$_udc stray=yes" ;;
+  esac
+}
+
+# 把**任何**自称 Apple 的 gadget 收掉，不只是我们自己那个：野 gadget（通常来自 .dev 脚本直接改 g1）
+# 不在模块的状态机里，`stop` 管不到它，而它只要绑着 UDC，有线就一直是"通着但开关说关闭"。
+# 顺序与 do_stop 相同（先解绑再清配置再还 id），并且刻意不碰 sys.usb.config 之外的框架属性。
+do_reclaim() {
+  _n=0
+  for _g in /config/usb_gadget/* /sys/kernel/config/usb_gadget/*; do
+    [ -d "$_g" ] || continue
+    [ "$(rd "$_g/idVendor")" = "0x05ac" ] || continue
+    [ "$(rd "$_g/idProduct")" = "0x12a8" ] || continue
+    _n=$((_n + 1))
+    log "reclaim: 收掉自称 Apple 的 gadget $_g（id=$(rd "$_g/idVendor"):$(rd "$_g/idProduct") udc=$(rd "$_g/UDC")）"
+    selinux_relax
+    [ -w "$_g/UDC" ] && wr "$_g/UDC" ""
+    for _c in "$_g"/configs/*/; do
+      [ -d "$_c" ] || continue
+      for _l in "$_c"*; do [ -L "$_l" ] && rm -f "$_l"; done
+      rmdir "$_c"strings/0x409 "$_c"strings 2>/dev/null
+      rmdir "$_c" 2>/dev/null
+    done
+    rmdir "$_g/functions/$NCM_NAME" "$_g/functions/$FFS_NAME" 2>/dev/null
+    if [ "$_g" = "$G" ]; then
+      restore_gadget_identity
+    else
+      echo 0x18d1 > "$_g/idVendor" 2>/dev/null
+      echo 0x4ee7 > "$_g/idProduct" 2>/dev/null
+    fi
+    selinux_restore
+  done
+  if [ "$_n" = "0" ]; then
+    log "reclaim: 没有自称 Apple 的 gadget（无需清理）"
+  else
+    # 同样走 hook 恢复：先解绑（上面已做）再放行 init，它会把 Android 的 g1 建回来。
+    init_usb_restore
+    sleep 3
+    log "reclaim: 已清理 $_n 个；sys.usb.config=$(getprop sys.usb.config) configfs=$(getprop sys.usb.configfs)"
+  fi
+}
+
+case "${1:-status}" in
+  guard)
+    shift
+    guard_descriptors
+    exit 0
+    ;;
+  start)  do_start "${2:-full}" ;;
+  stop)   do_stop ;;
+  reclaim) do_reclaim ;;
+  status) do_status ;;
+  *) echo "用法：$0 {start [full|ncm]|stop|reclaim|status}"; exit 2 ;;
+esac

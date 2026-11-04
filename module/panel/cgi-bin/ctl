@@ -1,0 +1,5 @@
+#!/system/bin/sh
+# 转发壳：面板的 CGI 只有一份实现，在 webroot/cgi-bin/ctl（busybox httpd 的文档根就是
+# webroot，所以线上真正被执行的也是那一份）。这里保留一个同名入口，方便把文档根换成模块
+# 目录时（-h <模块目录>）仍然有 /panel/cgi-bin/ctl 可调用，不复制任何逻辑。
+exec "$(dirname "$0")/../../webroot/cgi-bin/ctl"

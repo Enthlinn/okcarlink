@@ -1,0 +1,103 @@
+name: build
+
+# Plan C.  A hosted runner cannot build this module from scratch: the payload compiles against
+# the platform framework including hidden APIs, and the two native binaries link static bionic
+# and static BoringSSL.  So a machine with an AOSP tree publishes tools/make-aosp-deps.sh output
+# as a release asset, and this workflow compiles daemon/src itself and only assembles the module.
+# See docs/en/building.md ("CI" / "Building on a hosted runner").
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      aosp_deps_tag:
+        description: Release tag holding okcarlink-aosp-deps.tar.gz
+        required: false
+        default: aosp-deps
+
+permissions:
+  contents: write
+
+env:
+  AOSP_DEPS_TAG: ${{ github.event.inputs.aosp_deps_tag || 'aosp-deps' }}
+  BUILD_TOOLS: '34.0.0'
+  PLATFORM: 'android-33'
+
+jobs:
+  module:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install d8 (build-tools) and android.jar (platform)
+        run: sdkmanager --install "build-tools;$BUILD_TOOLS" "platforms;$PLATFORM"
+
+      - name: Fetch the AOSP dependency bundle
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh release download "$AOSP_DEPS_TAG" -R "$GITHUB_REPOSITORY" \
+            -p okcarlink-aosp-deps.tar.gz -O /tmp/deps.tar.gz --clobber
+          mkdir -p /tmp/deps
+          tar -xzf /tmp/deps.tar.gz -C /tmp/deps
+          ( cd /tmp/deps && grep -E '^[0-9a-f]{64}  ' deps-manifest.txt | sha256sum -c - )
+
+      - name: Compile daemon/src and assemble the module
+        run: |
+          set -euo pipefail
+          mkdir -p build
+          cp /tmp/deps/prebuilt/okcar-uinputd /tmp/deps/prebuilt/okcar-ffs-usbmux build/
+          export FRAMEWORK_JARS=/tmp/deps/framework-jars
+          export ANDROID_JAR="$ANDROID_SDK_ROOT/platforms/$PLATFORM/android.jar"
+          export D8="$ANDROID_SDK_ROOT/build-tools/$BUILD_TOOLS/d8"
+          export REQUIRE_ARTIFACTS=1
+          bash tools/package-module.sh
+
+      - name: Verify the package
+        run: |
+          set -euo pipefail
+          zip=$(ls build/okcarlink-*.zip)
+          unzip -l "$zip"
+          for f in module.prop post-fs-data.sh service.sh \
+                   system/bin/okcar-uinputd system/bin/okcar-ffs-usbmux \
+                   payload/okcar-link.dex webroot/variant webroot/app.js; do
+            unzip -l "$zip" | grep -q " $f$" || { echo "missing from the zip: $f"; exit 1; }
+          done
+          unzip -p "$zip" module.prop | grep -q '^version=1.0.0$' || { echo "module.prop is not 1.0.0"; exit 1; }
+          unzip -p "$zip" payload/okcar-link.dex > /tmp/okcar-link.dex
+          [ "$(head -c 3 /tmp/okcar-link.dex)" = "dex" ] || { echo "payload is not a dex"; exit 1; }
+          grep -aq 'com/okcar/link/daemon/LinkDaemon' /tmp/okcar-link.dex \
+            || { echo "the dex does not contain LinkDaemon: wrong classpath or sources"; exit 1; }
+          sha256sum /tmp/okcar-link.dex build/okcar-uinputd build/okcar-ffs-usbmux
+          sha256sum "$zip" > "$zip.sha256"
+          cat "$zip.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: okcarlink-module
+          path: |
+            build/okcarlink-*.zip
+            build/okcarlink-*.zip.sha256
+          if-no-files-found: error
+
+      - name: Attach the package to the release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          zip=$(ls build/okcarlink-*.zip)
+          gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 \
+            || gh release create "$GITHUB_REF_NAME" --title "OkCarLink $GITHUB_REF_NAME" \
+                 --notes "KernelSU/Magisk module built by .github/workflows/build.yml. Assets include the SHA-256 file."
+          gh release upload "$GITHUB_REF_NAME" "$zip" "$zip.sha256" --clobber
