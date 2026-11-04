@@ -267,6 +267,14 @@ is cycled, because each process builds its TLS context once; a mismatch is repor
 match`. `okcar-port-ctl identity` reports what is installed and `identity regen` replaces it — full row set in
 `docs/en/crypto.md` §6.
 
+Boot auto-start is armed by `okcar-port-ctl wired-boot`, which runs 45 s after `sys.boot_completed`
+(`OKCAR_WIRED_BOOT_DELAY`). If two consecutive boots never reach `okcar-carkit.state=started`, it writes
+`/data/local/tmp/okcar-wired-boot.disabled` and stops trying, so a boot loop cannot turn into a reboot loop. That
+is the one state where the wired switch reads *on* and nothing happens: the WebUI reports *Boot auto-start
+disabled after two failed boots* and offers *Re-arm boot auto-start*. `okcar-port-ctl wired-boot-state` prints
+`ok` / `disabled` / `pending` / `fails=<n>`; `okcar-port-ctl wired-boot-arm` clears the markers, and so does
+`switch wired on`.
+
 ### 2.8 Step 8 — CI on a hosted runner
 
 A hosted runner cannot build this module from scratch: the hidden-API framework jars and the static bionic/BoringSSL
@@ -321,6 +329,7 @@ bundle above, and one `tools/package-module.sh` for both.
 | Mirroring on the head unit but no touches on the car screen | `build/okcar-uinputd` was skipped | same |
 | `NO_CERTIFICATE_SET` at `EnableSessionSSL` — "no certificate set" | the pair is missing, unreadable or empty — a factory reset wipes `/data/local/tmp`, and generation only runs during a wired start | cycle the wired switch so `okcar-carkit` generates the pair, or run `okcar-port-ctl identity regen`; full row set and the mismatch case in `docs/en/crypto.md` §6 |
 | `tls: cert/key do not match` in the wired log | the installed certificate and key are not one pair (a pinned `payload/` pair overwrote one half) | `okcar-port-ctl identity regen`, which writes a matching pair (§2.2) |
+| Wired switch reads *on*, `okcar-carkit.state` stays empty and nothing re-enumerates on boot | two consecutive boots never reached `started`, so `okcar-port-ctl wired-boot` disabled itself and wrote `okcar-wired-boot.disabled` | `okcar-port-ctl wired-boot-arm` (or `switch wired on`), then look at `okcar-carkit.log` for why those two boots failed |
 | A newly installed pair has no effect | each process builds its TLS context once | cycle the wired switch, or restart the module — `okcar-port-ctl identity regen` does it for you when wired is running |
 | `LEAK: <file>` ... `aborted`, exit 1, no zip produced | a staged file matches one of the three pattern groups | the output names the file and up to five matched literals; remove the content and re-run |
 | A build "succeeded" but the zip contains last week's binaries | a skipped build was silently satisfied by a leftover `build/` artifact | `rm -rf build/` and rebuild (§2.5) |

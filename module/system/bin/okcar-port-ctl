@@ -826,6 +826,22 @@ wired_boot_autostart() {
   return 1
 }
 
+# 有线开机自启的**武装状态**：ok / disabled / pending / fails=<n>。
+# 只读文件，不碰 USB、不碰 configfs，所以探针里每 5 秒调一次也是安全的。
+wired_boot_state() {
+  _off=${TMP}/okcar-wired-boot.disabled
+  _fails=${TMP}/okcar-wired-boot.fails
+  _pend=${TMP}/okcar-wired-boot.pending
+  if [ -f "$_off" ]; then echo disabled; return 0; fi
+  if [ -f "$_pend" ]; then echo pending; return 0; fi
+  _n=$(cat "$_fails" 2>/dev/null)
+  case "$_n" in
+    ''|*[!0-9]*) echo ok ;;
+    0) echo ok ;;
+    *) echo "fails=$_n" ;;
+  esac
+}
+
 case "$1" in
   switches|switch)
     if [ "$1" = "switch" ]; then switch_set "$@"; fi
@@ -833,6 +849,13 @@ case "$1" in
     ;;
   apply) apply_all "${2:-manual}" ;;
   wired-boot) wired_boot_autostart "${2:-}" ;;
+  wired-boot-state) wired_boot_state ;;
+  wired-boot-arm)
+    # 重新武装开机自启：清掉停用标记与失败计数（不动开关本身）。
+    rm -f "${TMP}/okcar-wired-boot.disabled" "${TMP}/okcar-wired-boot.fails" "${TMP}/okcar-wired-boot.pending" 2>/dev/null
+    echo "wired-boot 已重新武装"
+    echo "wired_boot=$(wired_boot_state)"
+    ;;
   caps)  caps_report "${2:-}" ;;
   bt-sdp)    CHANGED=0
     case "${2:-show}" in
@@ -872,6 +895,7 @@ case "$1" in
     echo "did_vendor=$(getprop $DID_PROP) (Apple=0x004C)"
     platform_info
     show_switches
+    echo "wired_boot=$(wired_boot_state)"
     echo "self=$0 overlay_mounted=$( [ -x /system/bin/okcar-port-ctl ] && echo yes || echo no )"
     echo "idc=$( [ -f /system/usr/idc/okcar-uinput-touch.idc ] && echo present || echo absent )"
     echo "bt.mac=$(bt_mac_hex)"

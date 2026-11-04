@@ -186,7 +186,7 @@ switch off simply does not re-apply that switch's effect.
 | `linkd` | on | starts or stops the daemon process | no | off suppresses the boot start; the WebUI switch starts it with no reboot |
 | `session` | on | stops the RFCOMM listener inside a running daemon | no | read at daemon start |
 | `anim` | off | forces animation scales while mirroring and restores them after | no | off is inert; on applies during the next mirror session |
-| `wired` | off | rebinds the whole USB gadget as an Apple device | **yes** | never applied at boot; only the detached wired-boot autostart may, and it self-disables after two failed autostart-then-reboot cycles |
+| `wired` | off | rebinds the whole USB gadget as an Apple device | **yes** | never applied at boot; only the detached wired-boot autostart may, and it self-disables after two failed autostart-then-reboot cycles, re-armed with `okcar-port-ctl wired-boot-arm` |
 
 Two safety behaviours belong to the switch layer rather than to one switch:
 the daemon and the session are bound together (the `linkd` and `session`

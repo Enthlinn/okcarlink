@@ -261,6 +261,13 @@ okcar-port-lite,okcarlink}` 以及 `/data/adb/modules_update` 下的相同路径
 TLS 上下文；不一致会以 `tls: cert/key do not match` 报告一次。`okcar-port-ctl identity` 报告当前装的是什么，
 `identity regen` 则换掉它——完整行集见 `docs/zh/crypto.md` §6。
 
+开机自启由 `okcar-port-ctl wired-boot` 拉起，它在 `sys.boot_completed` 之后 45 秒运行
+（`OKCAR_WIRED_BOOT_DELAY`）。如果连续两次开机都没能到达 `okcar-carkit.state=started`，它会写
+`/data/local/tmp/okcar-wired-boot.disabled` 并且不再尝试——这样一次启动失败不会演变成重启循环。这也正是
+有线开关显示"开"却什么都不发生的唯一情形：WebUI 会报*连续两次开机自启没站住，已自动停用*，并给出*恢复开机自启*
+按钮。`okcar-port-ctl wired-boot-state` 打印 `ok` / `disabled` / `pending` / `fails=<n>`；
+`okcar-port-ctl wired-boot-arm` 清掉标记，`switch wired on` 也会清。
+
 ### 2.8 第 8 步——在托管 runner 上做 CI
 
 托管 runner 无法从零构建本模块：隐藏 API 的 framework jar 与静态 bionic/BoringSSL 原生都不来自公开 SDK，而
@@ -311,6 +318,7 @@ TLS 上下文；不一致会以 `tls: cert/key do not match` 报告一次。`okc
 | 车机能镜像但车机屏幕没有触摸 | `build/okcar-uinputd` 被跳过 | 同上 |
 | `EnableSessionSSL` 处 `NO_CERTIFICATE_SET`——"no certificate set" | 密钥对缺失、不可读或为空——恢复出厂设置会清空 `/data/local/tmp`，而生成只在有线启动时跑 | 循环一次有线开关让 `okcar-carkit` 生成密钥对，或跑 `okcar-port-ctl identity regen`；完整行集与不一致情形见 `docs/zh/crypto.md` §6 |
 | 有线日志里 `tls: cert/key do not match` | 已安装的证书与密钥不是同一对（`payload/` 里固定的密钥对只覆盖了其中一半） | `okcar-port-ctl identity regen`，它会写出匹配的一对（第 2.2 节） |
+| 有线开关显示"开"，`okcar-carkit.state` 一直为空，开机后什么都不重新枚举 | 连续两次开机都没到 `started`，于是 `okcar-port-ctl wired-boot` 自行停用并写了 `okcar-wired-boot.disabled` | `okcar-port-ctl wired-boot-arm`（或 `switch wired on`），然后看 `okcar-carkit.log` 里那两次开机为什么失败 |
 | 新安装的密钥对不生效 | 每个进程只构建一次 TLS 上下文 | 循环有线开关，或重启模块——有线正在跑时 `okcar-port-ctl identity regen` 会替你做这件事 |
 | `LEAK: <file>` ... `aborted`，退出 1，未产出 zip | 某个暂存文件命中三组模式之一 | 输出会指出文件与最多五个匹配字面量；删掉该内容后重跑 |
 | 构建"成功"，但 zip 里是上周的二进制 | 被跳过的构建被 `build/` 里遗留的旧产物悄悄满足 | `rm -rf build/` 后重建（第 2.5 节） |

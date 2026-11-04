@@ -636,6 +636,10 @@ function probeCommand(p) {
     'echo "carpp_status=$(grep -v \'^#\' ' + q(CARPP_DIR + '/status') + ' 2>/dev/null | tail -n 4 | tr \'\\n\' \'|\')"',
     'echo "standalone=$(cat ' + q(CARPP_DIR + '/standalone') + ' 2>/dev/null)"',
     /* 这台机器是什么（root 框架 / Android / WebUI / SE / bt.mac / DID）：换机时先看这一行。 */
+    /* 开机自启的**武装状态**（ok / disabled / pending / fails=n）。连续两次没站住时
+     * wired-boot 会写 okcar-wired-boot.disabled 并从此静默不拉起 —— 面板必须说出来，
+     * 否则表现就是"有线开关开着、重启之后永远 Starting..."，看起来像模块坏了。 */
+    'echo "wire_boot=$(' + q(p.ctl) + ' wired-boot-state 2>/dev/null)"',
     'echo "wire_state=$(cat ' + TMP + '/okcar-carkit.state 2>/dev/null)"',
     /* 有线模式的**事实**（哪个 gadget 正自称 Apple 且绑着 UDC），与开关文件里的"意图"分开。
      * 两者会分叉：2026-10-11 用 .dev 脚本直接改了框架的 g1，于是 wired=off 而 g1 上挂着
@@ -1000,6 +1004,9 @@ const ZH = {
   "USB adb stops while it is on (the module keeps adb over TCP, port 5555).  Turning the switch off unbinds the gadget and hands USB back to Android as an adb device.": "开着的时候 USB adb 会停（模块保留 TCP 5555 的 adb）；关掉会把 gadget 解绑，把 USB 交回 Android 当 adb 设备。",
   "The wired session carries the same stack as the wireless one: lockdown, the carkit service, the iAP2 session, then AirPlay over the NCM link.  It needs a TLS identity on the phone (/data/local/tmp/lockdown-cert.pem + lockdown-key.pem); if the pair is missing the handshake dies at EnableSessionSSL, so the module generates a self-signed one when it starts.": "有线会话跑的是和无线同一套：lockdown、carkit service、iAP2 会话，然后走 NCM 链路的 AirPlay。它需要手机上有一份 TLS 身份（/data/local/tmp/lockdown-cert.pem + lockdown-key.pem）；没有的话握手会死在 EnableSessionSSL，所以模块启动时会自己生成一份自签名的。",
   "Regenerate the TLS identity": "重新生成证书",
+  "Re-arm boot auto-start": "恢复开机自启",
+  "Clears the disabled/fails/pending markers so the next boot starts wired mode again.": "清掉停用/失败/待定标记，下次开机会重新拉起有线模式。",
+  "Boot auto-start disabled after two failed boots - re-arm it below": "连续两次开机自启没站住，已自动停用——用下面的按钮恢复",
   "Rewrites /data/local/tmp/lockdown-cert.pem and lockdown-key.pem with a fresh self-signed pair; a running wired link is rebuilt so the daemon loads it.": "用一对新的自签名证书覆盖 /data/local/tmp/lockdown-cert.pem 与 lockdown-key.pem；有线正在跑时会重建链路，让守护进程加载新的这一对。",
   "What it does: while a mirror/cast session runs, the three system animation scales (window/transition/animator) are forced to 0 and the values found before the session are restored when it ends. It removes the frame spike when opening an app in mirror mode.": "作用：镜像/投屏会话期间把系统三个动画时长（window/transition/animator）强制置 0，会话结束时把会话前读到的原值写回。用来去掉镜像模式下开应用那一帧的尖峰。",
   "On: this phone re-enumerates over USB as an Apple device (05ac:12a8) with the USBMUX interface and NCM, so a CarPlay host (a head unit, or the emulator on a second phone) can run wired CarPlay against it.  Off by default because it takes the whole USB port over.": "打开：本机在 USB 上重新枚举成 Apple 设备（05ac:12a8，带 USBMUX 接口和 NCM），说 CarPlay 的 USB 主机（车机，或第二台手机上的模拟器）就能对它跑有线 CarPlay。默认关闭，因为它会占掉整个 USB 口。",
@@ -1340,6 +1347,9 @@ const CATS = [
          * 状态**，把它也报成"被占用"会让有线开关看起来永远起不来（2026-10-11 现场）。 */
         if (/taken/.test(s.wire_port || '')) return bad('USB port taken by another function');
         if (/^failed/.test(s.wire_state || '')) return bad(s.wire_state);
+        /* 开关是开的，但开机自启被两次失败自动停用了：不是"正在起"，是**不会再起**了。
+         * 直接把原因和恢复入口说出来（下面的 Re-arm boot auto-start 动作）。 */
+        if (s.wire_boot === 'disabled') return warn('Boot auto-start disabled after two failed boots - re-arm it below');
         return warn('Starting...');
       }
       /* 开关说关，但 UDC 上真有个自称 Apple 的 gadget 绑着 —— 有线确实通着，报"关闭"就是在骗人。
@@ -1348,11 +1358,13 @@ const CATS = [
       return warn('Off');
     },
     raw: (s) => ['state=' + (s.wire_state || '-'), 'fact=' + (s.wire_fact || '-'),
-      'port=' + (s.wire_port || '-'), 'owner=' + (s.wire_owner || '-'), 'caps=' + (s.caps || '-')],
+      'port=' + (s.wire_port || '-'), 'owner=' + (s.wire_owner || '-'), 'caps=' + (s.caps || '-'),
+      'boot=' + (s.wire_boot || '-')],
     actions: [
       { label: 'Wired status', cmd: (p) => 'sh ' + q(p.carkit) + ' status 2>&1 | tail -12' },
       { label: 'Rebuild the USB gadget', warn: 'Unbinds and re-creates the gadget, then re-enumerates as an iPhone.', cmd: (p) => 'sh ' + q(p.carkit) + ' start full 2>&1 | tail -12' },
       { label: 'Give USB back to Android', warn: 'Unbinds the gadget, restores sys.usb.config=adb and turns the Java side off.', cmd: (p) => 'sh ' + q(p.carkit) + ' stop 2>&1 | tail -6' },
+      { label: 'Re-arm boot auto-start', warn: 'Clears the disabled/fails/pending markers so the next boot starts wired mode again.', cmd: (p) => q(p.ctl) + ' wired-boot-arm 2>&1 | tail -4' },
       { label: 'Regenerate the TLS identity', warn: 'Rewrites /data/local/tmp/lockdown-cert.pem and lockdown-key.pem with a fresh self-signed pair; a running wired link is rebuilt so the daemon loads it.', cmd: (p) => q(p.ctl) + ' identity regen 2>&1 | tail -12' },
       { label: 'Reclaim a stray Apple gadget', warn: 'Unbinds and clears any gadget that claims to be an iPhone (including one built outside this module), then hands USB back to Android.', cmd: (p) => 'sh ' + q(p.carkit) + ' reclaim 2>&1 | tail -8' },
     ],

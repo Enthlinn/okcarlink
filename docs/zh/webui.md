@@ -62,6 +62,7 @@ WebView 里并不存在的 HTTP 路径。
 | --- | --- |
 | `switches` / `switch-state <key>` / `switch <key> on｜off` | 以 `<key> <state> default=<state> - description` 打印全部开关，或设置七个开关之一并应用它 |
 | `apply [boot｜early｜manual]`、`wired-boot` | 在一个阶段（2.3）应用这些开关；分离的有线启动自动项 |
+| `wired-boot-state` / `wired-boot-arm` | 打印开机自启的断路器状态（`ok` / `disabled` / `pending` / `fails=<n>`），不碰 USB；或清掉标记让下次开机再试一次 |
 | `caps` / `status` / `where` / `platform` | USB 与能力事实（管理器、configfs、UDC、Type-C 节点、uinput、functionfs、内核模块）、状态头部、模块路径、叠加状态、Android 版本、root 提供方 |
 | `oui` / `spoof-bt` / `restore-bt` / `bt-did` / `bt-name` / `bt-sdp` | WebUI 仍在使用的历史蓝牙动词：MAC OUI、SDP Device ID、设备名、SDP 精简与恢复 |
 | `wm <WxH>` / `grant` / `net-recover` / `stall-clear` | 显示尺寸提示、授予守护进程的运行时权限、重启 Wi-Fi（始终分离）、清理一次长时间的停滞窗口 |

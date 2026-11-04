@@ -54,6 +54,7 @@ One script, the single root entry point for every privileged step, at
 | --- | --- |
 | `switches` / `switch-state <key>` / `switch <key> on｜off` | Print all switches as `<key> <state> default=<state> - description`, or set one of the seven and apply it |
 | `apply [boot｜early｜manual]`, `wired-boot` | Apply the switches in one stage (2.3); the detached wired-boot autostart |
+| `wired-boot-state` / `wired-boot-arm` | Print the boot auto-start breaker (`ok` / `disabled` / `pending` / `fails=<n>`) without touching USB, or clear the markers so the next boot tries again |
 | `caps` / `status` / `where` / `platform` | USB and capability facts (manager, configfs, UDC, Type-C node, uinput, functionfs, kernel modules), the status head, module paths, overlay state, Android version, root provider |
 | `oui` / `spoof-bt` / `restore-bt` / `bt-did` / `bt-name` / `bt-sdp` | Historical Bluetooth verbs still used by the WebUI: MAC OUI, SDP Device ID, device name, SDP trim and restores |
 | `wm <WxH>` / `grant` / `net-recover` / `stall-clear` | Display size hint, grant the daemon's runtime permissions, bounce Wi-Fi (always detached), clear a long stall window |
