@@ -2262,7 +2262,7 @@ public final class WirelessAirPlayClient {
         while (System.currentTimeMillis() < deadline) {
             for (String host : candidates) {
                 attempt++;
-                final Socket socket = new Socket();
+                Socket socket = new Socket();
                 try {
                     /* A link-local target only works when the SCOPE reaches the socket.  Passing
                      * "fe80::2%usb0" as a *host string* is not enough on this ROM: the wired dial
@@ -2279,10 +2279,12 @@ public final class WirelessAirPlayClient {
                                 + " -> no scope id resolved (interface missing?); the kernel will"
                                 + " reject this connect with EINVAL");
                     }
+                    boolean boundLocal = false;
                     final java.net.InetAddress local = carrierLocalAddress(target);
                     if (local != null) {
                         try {
                             socket.bind(new java.net.InetSocketAddress(local, 0));
+                            boundLocal = true;
                             mState.log("airplay", "  " + host + " bound local "
                                     + local.getHostAddress());
                         } catch (java.net.BindException e) {
@@ -2300,7 +2302,33 @@ public final class WirelessAirPlayClient {
                                     + ") - connecting with the scope only");
                         }
                     }
-                    socket.connect(target, CONNECT_TIMEOUT_MS);
+                    final long connectStart = System.nanoTime();
+                    try {
+                        socket.connect(target, CONNECT_TIMEOUT_MS);
+                    } catch (java.io.IOException first) {
+                        /* The source-bound connect can be rejected by the local policy
+                         * routing before a single SYN leaves (measured 2026-11-04 on the
+                         * raw NCM gadget: the same kernel accepted an unbound
+                         * `nc fe80::2%usb0 7000` instantly while the source-bound JVM
+                         * dial returned ENETUNREACH ~2 ms in).  The scope on the target is
+                         * what pins the interface, so a connect that dies INSTANTLY with a
+                         * routing error is retried on a fresh socket without the local bind
+                         * before the candidate is given up. */
+                        if (boundLocal && instantUnreach(first, System.nanoTime() - connectStart)) {
+                            try {
+                                socket.close();
+                            } catch (java.io.IOException ignored) {
+                                /* replaced below */
+                            }
+                            socket = new Socket();
+                            mState.log("airplay", "  " + host
+                                    + " source-bound connect rejected instantly ("
+                                    + first.getMessage() + ") - retrying with the scope only");
+                            socket.connect(target, CONNECT_TIMEOUT_MS);
+                        } else {
+                            throw first;
+                        }
+                    }
                     socket.setSoTimeout(READ_TIMEOUT_MS);
                     mState.log("airplay", "connected via candidate " + host
                             + " (attempt " + attempt + ")");
@@ -2324,6 +2352,20 @@ public final class WirelessAirPlayClient {
         mState.log("airplay", "no candidate accepted a connection within "
                 + (CONNECT_WINDOW_MS / 1000) + "s");
         return null;
+    }
+
+    /* A connect that dies within a second carrying a routing errno was refused
+     * locally before any packet could be sent -- that is the local-bind/policy-
+     * routing interaction on raw gadget interfaces, not a network failure
+     * (2026-11-04: ENETUNREACH in ~2 ms while the same target+scope connected
+     * instantly from an unbound nc).  Timeouts and refused dials must not match. */
+    private static boolean instantUnreach(java.io.IOException e, long elapsedNanos) {
+        if (elapsedNanos > 1_000_000_000L) {
+            return false;
+        }
+        final String m = String.valueOf(e.getMessage());
+        return m.contains("ENETUNREACH") || m.contains("EINVAL")
+                || m.contains("EHOSTUNREACH") || m.contains("ENETDOWN");
     }
 
     /**
