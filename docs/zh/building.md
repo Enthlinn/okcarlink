@@ -323,6 +323,7 @@ TLS 上下文；不一致会以 `tls: cert/key do not match` 报告一次。`okc
 | `LEAK: <file>` ... `aborted`，退出 1，未产出 zip | 某个暂存文件命中三组模式之一 | 输出会指出文件与最多五个匹配字面量；删掉该内容后重跑 |
 | 构建"成功"，但 zip 里是上周的二进制 | 被跳过的构建被 `build/` 里遗留的旧产物悄悄满足 | `rm -rf build/` 后重建（第 2.5 节） |
 | `REQUIRE_ARTIFACTS=1: refusing to package an incomplete module`，退出 1 | 三个产物缺了一个，且开了 CI 式严格模式 | 带 `TREE` 补建缺的那件，或取依赖包（第 2.8 节） |
+| 有线正常，但 WebUI 一直显示无线监听未发布 | 守护进程没再应答：`status` 的回复没有落盘，`okcar-linkd.status` 的时间戳一直是旧的 | 看 `/data/local/tmp/okcar-linkd.status` 的时间戳，并跑 `okcar-linkd status`——它必须打印 `running pid=…`；没有就 `okcar-linkd restart`。1.0.0 里监督者的每一次 `pgrep` 与 `/proc` 读取都加了上限，守护进程在探测中途死掉不会再把它卡死到永不重启 |
 
 ## 4. 本仓库不构建什么
 
@@ -389,5 +390,3 @@ com.okcar.link.daemon.LinkDaemon`，此前先填好 `app_process` 期望的 `AND
 | `native/ffs-usbmux/okcar-ffs-usbmux.c` | 运行期解析的 `DevicePublicKey`（从已安装证书读取，编译期常量作为覆盖）、lockdownd 端口 `62078`、`okcar-carkit` 抽象 socket、无密钥材料的警告 |
 | `tools/make-aosp-deps.sh`、`.github/workflows/build.yml` | CI 依赖包的构成与发布，以及 runner 实际执行的组装路径与校验 |
 | `README.md`、`README.zh-CN.md` | 本页不得与之矛盾的快速开始预期 |
-| `native/ffs-usbmux/okcar-ffs-usbmux.c` | `DEVICE_PUBKEY_PKCS1_PEM_B64` 占位符、lockdownd 端口 `62078`、`okcar-carkit` 抽象套接字、占位符警告 |
-| `README.md`、`README.zh-CN.md` | 本页不得与之矛盾的快速上手预期 |

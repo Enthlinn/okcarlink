@@ -38,6 +38,37 @@ if [ ! -f "$MODDIR/payload/okcar-link.dex" ]; then
     if [ -f "$_c/payload/okcar-link.dex" ]; then MODDIR=$_c; break; fi
   done
 fi
+
+# ---- 有界探针（2026-11-05 现场修复）-------------------------------------------------------
+# 现场（217）：守护进程刚被 kill 的那一瞬间，监督者读 /proc/<pid>/cmdline 的那条管道永久卡住
+# （tr 一直 R 状态、sed 卡在 pipe_read），监督者从此停在那条命令替换里 —— 既不判活，也不再重启
+# 守护进程，日志停在最后一行 "supervisor: daemon exited (rc=143) — restarting" 就再也不动。
+# 用户看到的是「有线还能用、无线一直显示监听未发布」。
+# 根因不是会话状态机，而是 /proc 读取本身：进程正在死亡或被冻结时 read 可以永久阻塞，而它跑在
+# 监督者的热路径上。结论：脚本里所有 pgrep 与 /proc 读取都必须有界，下面两个包装是唯一入口。
+_TO=$(command -v timeout 2>/dev/null)
+_PG=
+for _c in /system/bin/pgrep /system/xbin/pgrep /vendor/bin/pgrep; do
+  [ -x "$_c" ] && { _PG=$_c; break; }
+done
+proc_read() {
+  [ -n "${1:-}" ] || return 0
+  if [ -n "$_TO" ]; then "$_TO" 2 cat "$1" 2>/dev/null; else cat "$1" 2>/dev/null; fi
+}
+proc_cmdline() {
+  [ -n "${1:-}" ] || return 0
+  proc_read "/proc/$1/cmdline" | tr '\0' ' ' | head -c 4096
+}
+proc_environ() {
+  [ -n "${1:-}" ] || return 0
+  proc_read "/proc/$1/environ" | tr '\0' '\n' | head -c 262144
+}
+# pgrep 覆盖：全脚本十余处调用一次生效，语义不变，只是加了 3 秒上限。
+if [ -n "$_PG" ]; then
+  pgrep() {
+    if [ -n "$_TO" ]; then "$_TO" 3 "$_PG" "$@" 2>/dev/null; else "$_PG" "$@" 2>/dev/null; fi
+  }
+fi
 # app_process aborts with "ANDROID_DATA environment variable unset" when it is started from a shell
 # that has no Android runtime environment.  Measured 2026-10-03 over SSH/adb shell: the supervisor
 # restarted the daemon every ~2 s and every life aborted (rc=0, empty log, no line printed), which
@@ -94,7 +125,7 @@ linkd_art_env() {
   fi
   for _p in $_pids; do
     [ -r "/proc/$_p/environ" ] || continue
-    _dump=$(tr '\0' '\n' < "/proc/$_p/environ" 2>/dev/null)
+    _dump=$(proc_environ "$_p")
     for _v in $_missing; do
       eval "_cur=\${$_v:-}"
       [ -n "$_cur" ] && continue
@@ -191,7 +222,7 @@ pid_is_ours() {
   _p=$1
   [ -n "$_p" ] || return 1
   kill -0 "$_p" 2>/dev/null || return 1
-  case "$(tr '\0' ' ' < "/proc/$_p/cmdline" 2>/dev/null)" in
+  case "$(proc_cmdline "$_p")" in
     *okcar-linkd*supervise*) return 0 ;;
   esac
   return 1
@@ -202,7 +233,7 @@ pid_is_daemon() {
   _p=$1
   [ -n "$_p" ] || return 1
   kill -0 "$_p" 2>/dev/null || return 1
-  case "$(tr '\0' ' ' < "/proc/$_p/cmdline" 2>/dev/null)" in
+  case "$(proc_cmdline "$_p")" in
     *"$DAEMON_CLASS"*) return 0 ;;
   esac
   return 1
@@ -213,7 +244,7 @@ pid_is_daemon() {
 daemon_mode() {
   _dp=$(pgrep -f "$DAEMON_CLASS" 2>/dev/null | head -n 1)
   [ -n "$_dp" ] || return 0
-  tr '\0' ' ' < "/proc/$_dp/cmdline" 2>/dev/null | sed -n 's/.*--mode[ =]\([^ ]*\).*/\1/p'
+  proc_cmdline "$_dp" | sed -n 's/.*--mode[ =]\([^ ]*\).*/\1/p'
 }
 
 # ---- 冻结保护（freezer pin）------------------------------------------------------------
@@ -238,7 +269,7 @@ CGROUP_SAFE_PATH=${OKCAR_CGROUP_SAFE_PATH:-/uid_0}
 linkd_cgroup_pin() {
   _pid=${1:-}
   [ -n "$_pid" ] || return 0
-  _cur=${2:-$(sed -n 's/^0:://p' "/proc/$_pid/cgroup" 2>/dev/null)}
+  _cur=${2:-$(proc_read "/proc/$_pid/cgroup" | sed -n 's/^0:://p')}
   case "$_cur" in
     "$CGROUP_SAFE_PATH"|"$CGROUP_SAFE_PATH"/*) ;;
     *)
@@ -315,8 +346,8 @@ animations_off() {
 # `pgrep -f "okcar-linkd start"` 一把梭：任何命令行里提到这几个字的外壳都会被误杀。
 reap_orphan_start_shells() {
   for _o in $(pgrep -f "[o]kcar-linkd start" 2>/dev/null); do
-    [ "$(awk '{print $4}' "/proc/$_o/stat" 2>/dev/null)" = "1" ] || continue
-    case "$(tr '\0' ' ' < "/proc/$_o/cmdline" 2>/dev/null)" in
+    [ "$(proc_read "/proc/$_o/stat" | awk '{print $4}')" = "1" ] || continue
+    case "$(proc_cmdline "$_o")" in
       *"$0 start"*) kill "$1" "$_o" 2>/dev/null ;;
     esac
   done

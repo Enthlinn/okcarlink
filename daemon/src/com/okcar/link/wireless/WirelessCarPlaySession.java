@@ -853,7 +853,7 @@ public final class WirelessCarPlaySession implements WirelessCarPlayDriver.Callb
         if (mStartSession != null) {
             sb.append(" | session=").append(mStartSession.describe());
         }
-        if (!mLastError.isEmpty()) {
+        if (mLastError != null && !mLastError.isEmpty()) {
             sb.append(" | last error=").append(mLastError);
         }
         return sb.toString();
@@ -1718,7 +1718,10 @@ public final class WirelessCarPlaySession implements WirelessCarPlayDriver.Callb
         } else {
             mStatus = "stopped — " + why;
         }
-        mLastError = null;
+        /* 2026-11-05 现场：这里原本写 null，于是 status() 的 `mLastError.isEmpty()` 抛 NPE，
+         * 整条 `status` 命令失败、状态文件再也不更新（日志里 245 次同一个 NPE，13:08 之后冻结）。
+         * 空串表达同一个意思，对调用方安全。 */
+        mLastError = "";
         LinkState.get().log("wireless", mStatus);
     }
 
@@ -1982,6 +1985,7 @@ public final class WirelessCarPlaySession implements WirelessCarPlayDriver.Callb
         if (context == null) {
             finishDirectJoin();
             releaseJoinClaim();
+            refreshIdleStatus("the Wi-Fi join could not start — still listening for the accessory");
             mLastError = "no context for the Wi-Fi join";
             return;
         }
@@ -2006,6 +2010,10 @@ public final class WirelessCarPlaySession implements WirelessCarPlayDriver.Callb
             return;
         }
         if (!result.submitted) {
+            /* 2026-11-05 现场：join 失败后 mStatus 永远停在 "joining … -> failed"，WebUI 据此算出
+             * session_active=false 并显示"监听未发布"，而 RFCOMM 监听其实还活着（有线不受影响）。
+             * 失败路径必须把状态还给"仍在监听"，错误细节留在 last error 里。 */
+            refreshIdleStatus("the Wi-Fi join failed — still listening for the accessory");
             mLastError = result.describe();
             releaseJoinClaim();
             return;
@@ -2017,6 +2025,7 @@ public final class WirelessCarPlaySession implements WirelessCarPlayDriver.Callb
         synchronized (mLock) {
             if (!mRunning) {
                 releaseJoinClaim();
+                refreshIdleStatus("the session was stopped mid-join");
                 mLastError = "session stopped before the AirPlay client was created";
                 return;
             }

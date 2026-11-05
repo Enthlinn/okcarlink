@@ -334,6 +334,7 @@ bundle above, and one `tools/package-module.sh` for both.
 | `LEAK: <file>` ... `aborted`, exit 1, no zip produced | a staged file matches one of the three pattern groups | the output names the file and up to five matched literals; remove the content and re-run |
 | A build "succeeded" but the zip contains last week's binaries | a skipped build was silently satisfied by a leftover `build/` artifact | `rm -rf build/` and rebuild (§2.5) |
 | `REQUIRE_ARTIFACTS=1: refusing to package an incomplete module`, exit 1 | one of the three artifacts was absent and CI-style strictness is on | build the missing piece with `TREE` set, or fetch the dependency bundle (§2.8) |
+| Wired works but the WebUI says the wireless listener is never published | the daemon stopped answering: its `status` reply is not being written, so `okcar-linkd.status` keeps an old timestamp | check the timestamp of `/data/local/tmp/okcar-linkd.status` and run `okcar-linkd status` — it must print `running pid=…`; if it does not, `okcar-linkd restart`. In 1.0.0 every `pgrep` and every `/proc` read inside the supervisor is bounded, so a daemon dying mid-probe can no longer wedge the supervisor into never restarting it |
 
 ## 4. What this repository does not build
 
