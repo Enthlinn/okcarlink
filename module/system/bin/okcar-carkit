@@ -1422,7 +1422,23 @@ do_start() {
     fi
   fi
   if [ -z "$(rd "$G/UDC")" ]; then
+    # 写成功了、读回来是空：gadget 绑上又被踢开。这一步最常见的两种物理原因，必须分开说，
+    # 2026-11-06 217 实测就是第二种（typec data_role=host）：
+    #   * UDC state=not attached —— 线没插上，或者插的是充电器（DCP，dwc3 永远不 attach）；
+    #   * data_role=host —— 口被切成 OTG 主机方向（插了 U 盘/读卡器之类的 sink），dwc3 在
+    #     host 模式，设备端 gadget 根本不可能枚举出来。
+    # 两者都不该报成"有人抢口"——抢口的特征是 port=owner=<别的持有者>。
+    _fb_st=$(rd "/sys/class/udc/$UDC_NAME/state")
+    _fb_dr=$(cat /sys/class/typec/port*/data_role 2>/dev/null | head -1)
     log "ERROR: bind failed after $_bind_try attempts: $(rd "$TMP/bind.err") -- 口不是被 init 抢的（它已静默）；看 port=owner 是谁"
+    log "  udc_state=$_fb_st data_role=$_fb_dr sys.usb.state=$(getprop sys.usb.state) usb_online=$(cat /sys/class/power_supply/usb/online 2>/dev/null)"
+    case "$_fb_st" in
+      attached*|configured) log "  提示：UDC 已 attach 却被踢开 —— 看 port=owner 是不是别的持有者" ;;
+      *) log "  提示：UDC 没 attach（线没插，或只插了充电器）。有线 CarPlay 需要把手机插到车机侧" ;;
+    esac
+    case "$_fb_dr" in
+      host*) log "  提示：Type-C 口当前是 host 方向（插了 U 盘/OTG 转接之类）。拔掉 sink 外设，改插车机" ;;
+    esac
     selinux_restore
     init_usb_restore
     set_state "failed:bind"
