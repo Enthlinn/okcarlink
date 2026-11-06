@@ -1149,7 +1149,9 @@ const CATS = [
         'echo "== 死机证据（内核/内存/崩溃）=="',
         'cat /proc/loadavg; uptime',
         'dmesg 2>/dev/null | grep -aiE "hang_detect|hung task|blocked for more than" | tail -10',
-        'for p in $(pgrep -f com.okcar.link.daemon.LinkDaemon); do echo "daemon pid=$p"; grep -E "VmRSS|Threads" /proc/$p/status; done',
+        /* pgrep 的模式必须做字符类转义：这台 ROM 的 pgrep -f 连自己都不排除，未转义时
+           探针进程自己的命令行里就含这个类名，日志里会多出一条"假 daemon"记录。 */
+        'for p in $(pgrep -f com[.]okcar[.]link[.]daemon[.]LinkDaemon); do echo "daemon pid=$p"; grep -E "VmRSS|Threads" /proc/$p/status; done',
         'logcat -b crash -d 2>/dev/null | tail -8',
         'logcat -d 2>/dev/null | grep -aiE "lowmemorykiller|lmkd|ANR in|WATCHDOG" | tail -8',
         'echo "== 蓝牙/无线日志行（logcat）=="',

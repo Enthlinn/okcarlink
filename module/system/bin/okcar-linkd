@@ -69,6 +69,36 @@ if [ -n "$_PG" ]; then
     if [ -n "$_TO" ]; then "$_TO" 3 "$_PG" "$@" 2>/dev/null; else "$_PG" "$@" 2>/dev/null; fi
   }
 fi
+
+# 2026-11-06 现场（217 全量重置后）：这台 ROM 的 toybox pgrep -f **连自己都不排除**，
+# 叠加上面的有界包装，`pgrep -f <class>` 的返回里既有 timeout 探针、也有 pgrep 自己
+# （实测 10681/10686 两条，/proc/<pid>/cmdline 就是那条探针命令行）。
+# 后果不是"多打两行"：**没有守护进程**也被读成"活着"，daemon_mode() 从探针命令行里
+# 取不到 --mode → _have 回落 app → 监督者每拍都判「模式漂移 file=mirror running=app」
+# 并把刚拉起的守护进程杀掉重来（现场：这条日志每 2~5 秒一条，连续 50 分钟）。
+# 守护进程永远写不出 okcar-linkd.status，用户看到的就是「刚装好就是一个监听未发布」。
+# 结论：凡按 DAEMON_CLASS 找进程，都必须验明 /proc/<pid>/cmdline 真的是守护进程。
+daemon_pids() {
+  for _cp in $(pgrep -f "$DAEMON_CLASS" 2>/dev/null); do
+    _cc=$(proc_cmdline "$_cp")
+    case "$_cc" in
+      # 探针链自己：timeout 包装与 pgrep/pkill 本体的命令行里必然含被匹配的那个串
+      *pgrep*|*pkill*|*timeout*) continue ;;
+    esac
+    case "$_cc" in
+      # 真正的守护进程只由 Android 运行时启动（app_process / dalvikvm）
+      *app_process*|*dalvikvm*) echo "$_cp" ;;
+    esac
+  done
+}
+
+# 按 daemon_pids 发信号。裸 `pkill -f "$DAEMON_CLASS"` 在这台 ROM 上同样会匹配到自己
+# （它的命令行里就含这个串），杀不干净；逐个验明正身再杀，并且对僵尸/已退场进程无副作用
+# （僵尸的 cmdline 是空的，daemon_pids 自然不会返回它）。
+daemon_kill() {
+  _dk=$1
+  for _cp in $(daemon_pids); do kill -"$_dk" "$_cp" 2>/dev/null; done
+}
 # app_process aborts with "ANDROID_DATA environment variable unset" when it is started from a shell
 # that has no Android runtime environment.  Measured 2026-10-03 over SSH/adb shell: the supervisor
 # restarted the daemon every ~2 s and every life aborted (rc=0, empty log, no line printed), which
@@ -242,7 +272,9 @@ pid_is_daemon() {
 # 守护进程实际在跑的模式，从它自己的命令行读（`--mode mirror|app`）。没有这个参数就是 app：
 # LinkDaemon 的 mirrorMode 默认 false。status 用它报"现在是什么"，supervise 用它和文件对账。
 daemon_mode() {
-  _dp=$(pgrep -f "$DAEMON_CLASS" 2>/dev/null | head -n 1)
+  # 取第一个**验明正身**的守护进程（见 daemon_pids 的 2026-11-06 注释）：以前这里直接
+  # 拿裸 pgrep 的头一个 pid，探针自己排在最前面，读出来的永远是空。
+  _dp=$(daemon_pids | head -n 1)
   [ -n "$_dp" ] || return 0
   proc_cmdline "$_dp" | sed -n 's/.*--mode[ =]\([^ ]*\).*/\1/p'
 }
@@ -366,13 +398,13 @@ stop_daemon() {
     fi
     rm -f "$PIDF"
   fi
-  pkill -f "$DAEMON_CLASS" 2>/dev/null
+  daemon_kill TERM
   # 必须等它真的消失：SIGTERM 是异步的，紧跟其后的 start 会把"正在退场"的进程当成"在跑"而
   # no-op，而监督者此刻已经被 stop 收掉 —— 结果是谁都没起来（宿主自检里稳定复现）。
   # 2 秒还不走就升级 SIGKILL，最多再等 3 秒。
   i=0
-  while [ "$i" -lt 25 ] && pgrep -f "$DAEMON_CLASS" >/dev/null 2>&1; do
-    [ "$i" = "10" ] && pkill -KILL -f "$DAEMON_CLASS" 2>/dev/null
+  while [ "$i" -lt 25 ] && [ -n "$(daemon_pids)" ]; do
+    [ "$i" = "10" ] && daemon_kill KILL
     sleep 0.2
     i=$((i + 1))
   done
@@ -403,7 +435,7 @@ do_stop() {
     esac
     rm -f "$SUPPID"
   fi
-  pkill -f "okcar-linkd supervise" 2>/dev/null
+  pkill -f "[o]kcar-linkd supervise" 2>/dev/null
   i=0
   while [ "$i" -lt 10 ] && pgrep -f "[o]kcar-linkd supervise" >/dev/null 2>&1; do
     sleep 1
@@ -426,7 +458,7 @@ do_stop() {
   sleep 1
   pkill -KILL -f "[o]kcar-linkd supervise" 2>/dev/null
   reap_orphan_start_shells -KILL
-  pkill -KILL -f "$DAEMON_CLASS" 2>/dev/null
+  daemon_kill KILL
   rm -rf "$SUPLOCK" 2>/dev/null
 }
 
@@ -481,12 +513,12 @@ case "${1:-start}" in
       absent=0
       drift=0
       while [ -f "$SUPERVISE" ] && kill -0 "$child" 2>/dev/null; do
-        if pgrep -f "$DAEMON_CLASS" >/dev/null 2>&1; then
+        _dp=$(daemon_pids | head -n 1)
+        if [ -n "$_dp" ]; then
           absent=0
           # 冻结保护，每拍复核：守护进程被别的入口重启、或被系统挪回某个 App cgroup 时自愈
           # （见 linkd_cgroup_pin；不写 USB、不碰任何会话状态，只动 cgroup 归属）
-          _dp=$(pgrep -f "$DAEMON_CLASS" 2>/dev/null | head -n 1)
-          [ -n "$_dp" ] && linkd_cgroup_pin "$_dp"
+          linkd_cgroup_pin "$_dp"
           # 模式对账。模式是守护进程的**启动参数**，面板只写文件；两者不同步时车机上就是另一个
           # 画面（2026-10-18 现场：文件 app、进程 --mode mirror —— 面板说应用投屏，车机上是镜像）。
           # 连续两拍都对不上才动手，避免读到半写状态就重启一个健康的会话。
@@ -530,8 +562,9 @@ case "${1:-start}" in
     fi
     ;;
   status)
-    if pgrep -f "$DAEMON_CLASS" >/dev/null 2>&1; then
-      echo "okcar-linkd: running pid=$(pgrep -f "$DAEMON_CLASS" | tr '\n' ' ')"
+    _dps=$(daemon_pids)
+    if [ -n "$_dps" ]; then
+      echo "okcar-linkd: running pid=$(echo $_dps | tr '\n' ' ')"
       # 正在跑的模式，取自守护进程自己的命令行。面板用它显示当前状态，而不是显示文件里"应该是
       # 什么"：文件由面板写、进程由启动参数决定，两者不同步时面板就会撒谎（2026-10-18 现场：
       # 文件 app、进程 --mode mirror，面板显示应用投屏、车机上是镜像）。
@@ -598,7 +631,7 @@ case "${1:-start}" in
     # in open(O_WRONLY) waiting for a reader — measured 2026-10-01: `okcar-linkd send status` after
     # a reboot hung the caller and the WebUI row with it.  Refuse when the daemon is gone, and open
     # read-write (O_RDWR never blocks) so a dying daemon cannot wedge the write either.
-    pgrep -f "$DAEMON_CLASS" >/dev/null 2>&1 \
+    [ -n "$(daemon_pids)" ] \
       || { echo "okcar-linkd: daemon not running, nothing to send to"; exit 1; }
     exec 3<>"$FIFO"
     printf '%s\n' "$*" >&3
@@ -661,7 +694,7 @@ case "${1:-start}" in
       # 只有"守护进程活着 **且** 还有监督者在管它"才算健康。否则（例如 stop 收掉监督者后
       # 守护进程还差一拍才退场，或历史上某个入口起了个无监督进程）这里必须接管，而不是 no-op：
       # 旧版只看守护进程，于是 no-op 之后监督者没了、进程也没了，现场表现为"启动没反应"。
-      if pgrep -f "$DAEMON_CLASS" >/dev/null 2>&1; then
+      if [ -n "$(daemon_pids)" ]; then
         if pgrep -f "[o]kcar-linkd supervise" >/dev/null 2>&1; then
           echo "okcar-linkd: already running pid=$(cat "$PIDF" 2>/dev/null) — start is a no-op (use restart)"
           exit 0
@@ -677,7 +710,7 @@ case "${1:-start}" in
       fi
       i=0
       while [ "$i" -lt 20 ]; do
-        if pgrep -f "$DAEMON_CLASS" >/dev/null 2>&1; then
+        if [ -n "$(daemon_pids)" ]; then
           echo "okcar-linkd: started pid=$(cat "$PIDF" 2>/dev/null) under supervision"
           exit 0
         fi
@@ -802,7 +835,7 @@ case "${1:-start}" in
       exit $rc
     fi
     sleep 2
-    if pgrep -f "$DAEMON_CLASS" >/dev/null 2>&1; then
+    if [ -n "$(daemon_pids)" ]; then
       echo "okcar-linkd: started pid=$(cat "$PIDF") dex=$DEX fifo=$FIFO args='$*'"
     else
       echo "okcar-linkd: failed to start — log follows"
