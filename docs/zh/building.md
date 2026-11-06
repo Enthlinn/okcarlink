@@ -325,6 +325,7 @@ TLS 上下文；不一致会以 `tls: cert/key do not match` 报告一次。`okc
 | `REQUIRE_ARTIFACTS=1: refusing to package an incomplete module`，退出 1 | 三个产物缺了一个，且开了 CI 式严格模式 | 带 `TREE` 补建缺的那件，或取依赖包（第 2.8 节） |
 | 有线正常，但 WebUI 一直显示无线监听未发布 | 守护进程没再应答：`status` 的回复没有落盘，`okcar-linkd.status` 的时间戳一直是旧的 | 看 `/data/local/tmp/okcar-linkd.status` 的时间戳，并跑 `okcar-linkd status`——它必须打印 `running pid=…`；没有就 `okcar-linkd restart`。1.0.0 里监督者的每一次 `pgrep` 与 `/proc` 读取都加了上限，守护进程在探测中途死掉不会再把它卡死到永不重启 |
  | 新装好的模块一直不发布监听，且 `okcar-linkd.log` 每隔几秒就重复 `supervisor: mode drift file=mirror running=app — restarting the daemon` | 监督者的判活探针匹配到了它自己：这台 ROM 的 `pgrep -f` 连自己都不排除，于是 `timeout 3 pgrep -f <class>` 这条探针进程被当成了“守护进程”，而它的命令行里没有 `--mode`，回落到 `app`，与面板写的 `mirror` 就成了“模式漂移” | 1.0.0 已修：`module/system/bin/okcar-linkd` 现在会在把某个 pid 当守护进程之前先验明 `/proc/<pid>/cmdline`（`daemon_pids`），所有原来用裸 `pgrep -f "$DAEMON_CLASS"` 的地方——`daemon_mode`、`stop_daemon`、监督循环、`status`、`send` 以及两处 `start` 轮询——都改了。旧版本的判据：`pgrep -f com[.]okcar[.]link[.]daemon[.]LinkDaemon | wc -l` 数出 pid 但 `/proc/<pid>/cmdline` 是空的，就是撞上了这条；更新模块即可 |
+ | `state=failed:bind`，日志写 `bind failed after N attempts ... 看 port=owner 是谁`，但 `port=free owner=none` | 模块没毛病：gadget 确实绑上了 UDC，又被控制器退回 | 看同一行日志里的 `udc_state=... data_role=...`。`udc_state=not attached` = 没插线（或只插充电器；专用充电口永远不会让 PHY attach）。`data_role=host` = Type-C 口处于 host 方向——插着 U 盘或 OTG 转接。处理：把手机插到车机侧，然后 `cat /sys/class/typec/port0/data_role` 应显示 `device` |
 
 ## 4. 本仓库不构建什么
 
