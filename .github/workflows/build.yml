@@ -28,6 +28,10 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v5
+        with:
+          # Full history + tags: the release notes need the commit range back to the
+          # previous tag (shallow clones cannot answer git describe/log across tags).
+          fetch-depth: 0
 
       - name: JDK 17
         uses: actions/setup-java@v5
@@ -116,7 +120,20 @@ jobs:
         run: |
           set -euo pipefail
           zip=$(ls build/okcarlink-*.zip)
-          gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 \
-            || gh release create "$GITHUB_REF_NAME" --title "OkCarLink $GITHUB_REF_NAME" \
-                 --notes "KernelSU/Magisk module built by .github/workflows/build.yml. Assets include the SHA-256 file."
+          # Release notes: the commit subjects since the previous tag, with the annotated
+          # tag's subject as a fallback and a plain line as the last resort. Generating
+          # notes must never fail the build, so every probe here is guarded.
+          notes=""
+          if prev=$(git describe --tags --abbrev=0 "${GITHUB_REF_NAME}^" 2>/dev/null); then
+            notes=$(git log --no-merges -30 --format='- %s' "$prev..$GITHUB_REF_NAME")
+          fi
+          if [ -z "$notes" ]; then
+            notes=$(git tag -l --format='%(contents:subject)' "$GITHUB_REF_NAME")
+          fi
+          [ -n "$notes" ] || notes="KernelSU/Magisk module built by .github/workflows/build.yml. Assets include the SHA-256 file."
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release edit "$GITHUB_REF_NAME" --notes "$notes"
+          else
+            gh release create "$GITHUB_REF_NAME" --title "OkCarLink $GITHUB_REF_NAME" --notes "$notes"
+          fi
           gh release upload "$GITHUB_REF_NAME" "$zip" "$zip.sha256" --clobber
