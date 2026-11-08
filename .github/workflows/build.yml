@@ -84,7 +84,13 @@ jobs:
                    payload/okcar-link.dex webroot/variant webroot/app.js; do
             unzip -l "$zip" | grep -q " $f$" || { echo "missing from the zip: $f"; exit 1; }
           done
-          unzip -p "$zip" module.prop | grep -q '^version=1.0.0$' || { echo "module.prop is not 1.0.0"; exit 1; }
+          # The zip must carry the version the tag names (v1.0.1 -> version=1.0.1);
+          # on non-tag builds just require a version line to exist.
+          _zipver=$(unzip -p "$zip" module.prop | sed -n 's/^version=//p' | head -1)
+          case "${GITHUB_REF_NAME:-}" in
+            v*) [ "$_zipver" = "${GITHUB_REF_NAME#v}" ] || { echo "module.prop version '$_zipver' does not match the tag $GITHUB_REF_NAME"; exit 1; } ;;
+            *) [ -n "$_zipver" ] || { echo "module.prop has no version line"; exit 1; } ;;
+          esac
           unzip -p "$zip" payload/okcar-link.dex > /tmp/okcar-link.dex
           [ "$(head -c 3 /tmp/okcar-link.dex)" = "dex" ] || { echo "payload is not a dex"; exit 1; }
           grep -aq 'com/okcar/link/daemon/LinkDaemon' /tmp/okcar-link.dex \
