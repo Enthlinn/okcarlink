@@ -136,6 +136,10 @@ cd "$STAGE"
 # directory to hand USB back and clear the runtime state.
 ZIP_FILES="module.prop post-fs-data.sh service.sh customize.sh uninstall.sh sepolicy.rule system webroot payload panel action.sh"
 [ -f "$STAGE/README.md" ] && ZIP_FILES="$ZIP_FILES README.md"
-zip -qr "$OUT/okcarlink-1.0.0.zip" $ZIP_FILES
-echo "built $OUT/okcarlink-1.0.0.zip (id okcarlink)"
-unzip -l "$OUT/okcarlink-1.0.0.zip"
+# Name the zip after the version the staged module.prop actually carries (okcarlink-<version>.zip),
+# so a release tag and its asset always agree; fall back to 1.0.0 only if the file is unreadable.
+ZIPVER=$(sed -n 's/^version=//p' "$STAGE/module.prop" | head -1)
+case "$ZIPVER" in ''|*[!0-9.]*) ZIPVER=1.0.0 ;; esac
+zip -qr "$OUT/okcarlink-$ZIPVER.zip" $ZIP_FILES
+echo "built $OUT/okcarlink-$ZIPVER.zip (id okcarlink)"
+unzip -l "$OUT/okcarlink-$ZIPVER.zip"
