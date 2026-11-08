@@ -1,7 +1,7 @@
 id=okcarlink
 name=OkCarLink
-version=1.0.0
-versionCode=100
+version=1.0.1
+versionCode=101
 author=okcarlink
 description=Wireless and wired (phone as the iPhone device side) CarPlay/AirPlay port for Android head units. Mirror the phone screen or stream a single app to the car display; control and logs live in the module WebUI. The wired switch is the only switch that reconfigures USB and defaults to off.
 description_zh=无线与有线（本机作为 iPhone 设备端）CarPlay/AirPlay 车机方案：把手机投屏或单个应用投射到车机屏幕，控制与日志都在模块 WebUI 中；wired 开关是唯一会重配 USB 的开关，默认关闭。

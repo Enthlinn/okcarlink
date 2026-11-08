@@ -1421,8 +1421,37 @@ do_start() {
       return 1
     fi
   fi
-  if [ -z "$(rd "$G/UDC")" ]; then
-    # 写成功了、读回来是空：gadget 绑上又被踢开。这一步最常见的两种物理原因，必须分开说，
+  # 绑定结果必须分清"读不通"与"真没绑"：rd() 对超时一律返回空，而 bind 恰恰是整个脚本里
+  # 最容易让栈忙一小会的写（等 PHY 落定）。2026-11-09 217 现场：bind 成功（身份读回
+  # 05ac:12a8）之后，UDC 的超时空读被当成"被踢"，一次成功的绑定被假判成 failed:bind、
+  # 口交还 init——插上车机后它只能看到安卓身份，DiPlay 永远不触发；再次重绑还把栈写进
+  # 内核 configfs 死锁。判据用 gadget_udc()"?"=读不通（未知）、""=真的没绑，处置完全不同。
+  _udc_rd=$(gadget_udc)
+  if [ "$_udc_rd" = "?" ]; then
+    _udc_wait=0
+    while [ "$_udc_wait" -lt 3 ]; do
+      sleep 1
+      _udc_wait=$((_udc_wait + 1))
+      _udc_rd=$(gadget_udc)
+      [ "$_udc_rd" != "?" ] && break
+    done
+  fi
+  if [ "$_udc_rd" = "?" ]; then
+    log "ERROR: 绑定后 $G/UDC 连续 $_udc_wait 秒读不通——先分型再下结论；不重绑（重绑正是把栈写进 D 态的动作），不放行 init"
+    configfs_probe "$G/UDC"
+    _du_rc=$?
+    if [ "$_du_rc" = "2" ]; then
+      log "ERROR: 探测读也超时——USB 栈已在内核里卡死（configfs 死锁）；用户态解不开，请重启手机恢复"
+      set_state "failed:usb-reboot-needed"
+    else
+      log "ERROR: 探测读得通但 UDC 读一直超时——USB 栈卡住（未死锁）；重启手机，或稍后 switch wired off 再 on"
+      set_state "failed:usb-stuck"
+    fi
+    selinux_restore
+    return 1
+  fi
+  if [ -z "$_udc_rd" ]; then
+    # 写成功了、读回来确实是空：gadget 绑上又被踢开。这一步最常见的两种物理原因，必须分开说，
     # 2026-11-06 217 实测就是第二种（typec data_role=host）：
     #   * UDC state=not attached —— 线没插上，或者插的是充电器（DCP，dwc3 永远不 attach）；
     #   * data_role=host —— 口被切成 OTG 主机方向（插了 U 盘/读卡器之类的 sink），dwc3 在
@@ -1439,8 +1468,18 @@ do_start() {
     case "$_fb_dr" in
       host*) log "  提示：Type-C 口当前是 host 方向（插了 U 盘/OTG 转接之类）。拔掉 sink 外设，改插车机" ;;
     esac
+    # 真被踢也不把口交还 init：init/HAL 只会重建安卓身份，车机从此看不到 iPhone。守卫本来就
+    # 是干这件事的（断言静默、夺口、受限自愈；wanted 已由 wired_switch_apply 写好），这里把
+    # 它提前孵化，让夺口按守卫的节拍有界地走，而不是一次性放弃。do_stop 会收掉它，不会泄漏。
+    # 这条路径到不了下面的 adb 守卫，先按旧规矩把 TCP adbd 拉起来，别断自己的后路。
+    setprop service.adb.tcp.port 5555 2>/dev/null
+    start adbd 2>/dev/null
+    if [ "${OKCAR_CARKIT_NO_GUARD:-0}" != "1" ]; then
+      setsid sh "$0" guard >>"$LOG" 2>&1 &
+      echo $! > "$GUARD_PID" 2>/dev/null
+      log "绑定被踢——描述符守卫（pid $(cat "$GUARD_PID" 2>/dev/null)）已接手夺口；夺回成功会把状态写回 started"
+    fi
     selinux_restore
-    init_usb_restore
     set_state "failed:bind"
     return 1
   fi
