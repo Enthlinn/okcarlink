@@ -21,7 +21,7 @@
  *
  * New in this revision, per the product requirements:
  *  - Title only says OkCarLink; the description paragraph is replaced by three modes, one of which
- *    (紫优的carplay++) stays disabled until its own module is installed.
+ *    (Enthlinn 的 carplay++) stays disabled until its own module is installed.
  *  - Line 3 is the overall module state and line 4 the Bluetooth state; while healthy they say
  *    运行中 in green.  Every category row below also shows only 运行中 while healthy; the real
  *    values and the restart/stop controls live in a panel that opens when the row is clicked.
@@ -865,7 +865,7 @@ const ZH = {
   "Wired frame rate": "有线帧率",
   "Wireless bitrate": "无线码率",
   "Wireless session": "无线会话",
-  "Zuiyou carplay++": "紫优的carplay++",
+  "Enthlinn carplay++": "Enthlinn 的 carplay++",
   "[startup failed]": "[启动失败]",
   "daemon switch on": "守护进程开关打开",
   "(no app list yet)": "（还没有应用清单）",
@@ -900,7 +900,7 @@ const ZH = {
   "Touch target mismatch": "触摸目标不一致",
   "\\n[self-check failed]": "\\n[自检出错]",
   "(tap to choose an app)": "（点这里选择应用）",
-  "Cast to Zuiyou display": "投紫优虚拟屏",
+  "Cast to Enthlinn display": "投 Enthlinn 虚拟屏",
   "Listener not published": "监听未发布",
   "Rebuild the USB gadget": "重建 USB gadget",
   "\\n[mode switch failed]": "\\n[切换模式出错]",
@@ -922,7 +922,7 @@ const ZH = {
   "\\n[WebUI unhandled rejection]": "\\n[WebUI 未处理异常]",
   "\\n[display mode switch failed]": "\\n[切换显示模式出错]",
   "Not inside the KernelSU manager": "未在 KernelSU 管理器内",
-  "Zuiyou carplay++ virtual display": "紫优的carplay++ 虚拟屏",
+  "Enthlinn carplay++ virtual display": "Enthlinn 的 carplay++ 虚拟屏",
   "saved; takes effect next session": "已保存，下次会话生效",
   "== session lines (logcat tail) ==": "== 会话行（logcat 尾部）=",
   "SDP DID (the production head unit detection)": "SDP DID（车机认机）",
@@ -975,7 +975,7 @@ const ZH = {
   "# okcar-port video bitrate and frame rate (0 = do not override)": "# okcar-port 视频码率与帧率（0 = 不覆盖，用与车机协商的值）",
   "written to ' + DIAG_FILE + ' ($(wc -c < ' + DIAG_FILE + ') bytes)": "已写入 ' + DIAG_FILE + ' ($(wc -c < ' + DIAG_FILE + ') 字节)",
   "Unbinds and re-creates the gadget, then re-enumerates as an iPhone.": "解绑并重建 gadget，然后重新枚举成 iPhone。",
-  "The Zuiyou carplay++ module currently decides which apps appear on the": "当前由「紫优的carplay++」模块决定虚拟屏上显示哪些应用；",
+  "The Enthlinn carplay++ module currently decides which apps appear on the": "当前由「Enthlinn 的 carplay++」模块决定虚拟屏上显示哪些应用；",
   "switch state not read yet: tapping it prints the command and result below": "还没读到开关状态：点一下会在下面输出命令与结果",
   "the SDP DID was changed back (the default switch is on), writing it again": "SDP DID 被改回去了（默认开关是打开），重新写入",
   "Forces window/transition/animator scales to 0 during mirror/cast sessions.": "镜像/投屏会话期间把 window/transition/animator 三个动画时长强制置 0。",
@@ -1056,7 +1056,7 @@ const EN_EXTRA = {
   "如果真要日常使用建议开启，关闭后系统启动时会强力污染配对过的蓝牙使其不再认为自己具有 carplay 能力，导致需要重新配对才能连接。": "If you really use it day to day, leave it on: with it off, system startup aggressively taints the paired Bluetooth so it no longer considers itself CarPlay-capable, and a re-pair is needed before it can connect.",
   "原因：车机的发现数据库装不下整份 SDP 应答（约 1600 B），记录一多就把末尾两条（我们自己的）挤掉，车机因此缓存不到 128 位 UUID、报不出无线 CarPlay 支持；把 EIR 14→9、SDP 18→13 之后 supportCarplay 才会翻回 true。": "Why: the production head unit (the integrator) head unit's discovery database cannot hold the whole SDP response (~1600 B), and with too many records it drops the last two (ours), so the head unit caches no 128-bit UUID and reports no wireless CarPlay support; shrinking EIR 14->9 and SDP 18->13 is what flips supportCarplay back to true.",
   "它只在配对阶段需要：车机把 SDP 缓存下来之后就不再需要裁剪，配对成功后可以关掉这个开关（关掉会还原五个 profile）。裁过头也是真的——更激进的一档会让车机干脆不把本机当手机分类。": "It is only needed while pairing: once the head unit has cached the SDP no trimming is needed, and after a successful pair this switch can be turned off (turning it off restores the five profiles). Over-trimming is real too -- a more aggressive level makes the head unit stop classifying this phone as a phone.",
-  "当前由「紫优的carplay++」模块决定虚拟屏上显示哪些应用；": "The Zuiyou carplay++ module currently decides which apps appear on the ",
+  "当前由「Enthlinn 的 carplay++」模块决定虚拟屏上显示哪些应用；": "The Enthlinn carplay++ module currently decides which apps appear on the ",
   "下面选中的应用只作为模块不可用时的备用目标。": "virtual display; the app selected below is only a fallback target when that module is unavailable.",
 };
 Object.assign(EN, EN_EXTRA);
@@ -1373,7 +1373,7 @@ const CATS = [
   },
   {
     id: 'carpp',
-    name: '紫优的carplay++ 虚拟屏',
+    name: 'Enthlinn 的 carplay++ 虚拟屏',
     requiresCarpp: true,
     health: (s) => (s.carpp_module === 'yes' ? ok() : bad('模块未安装')),
     raw: (s) => [
@@ -1383,7 +1383,7 @@ const CATS = [
       T('状态=') + (s.carpp_status || '-'),
     ],
     actions: [
-      { label: '投紫优虚拟屏', cmd: (p) => q(p.linkd) + ' send app ' + CARPP_PKG + ' && ' + q(p.linkd) + ' send app-ui - && ' + q(p.linkd) + ' send mode desktop' },
+      { label: '投 Enthlinn 虚拟屏', cmd: (p) => q(p.linkd) + ' send app ' + CARPP_PKG + ' && ' + q(p.linkd) + ' send app-ui - && ' + q(p.linkd) + ' send mode desktop' },
       { label: '回本机桌面', cmd: (p) => q(p.linkd) + ' send desktop' },
     ],
   },
@@ -1689,7 +1689,7 @@ function renderModes() {
     if (!state.carppModule) {
       appNote.textContent = '';
     } else if (state.mode === 'carplaypp') {
-      appNote.textContent = T('当前由「紫优的carplay++」模块决定虚拟屏上显示哪些应用；')
+      appNote.textContent = T('当前由「Enthlinn 的 carplay++」模块决定虚拟屏上显示哪些应用；')
         + T('下面选中的应用只作为模块不可用时的备用目标。');
     } else {
       const match = autoMatchApp();
@@ -1749,7 +1749,7 @@ async function setMode(mode, apply) {
     await execAndShow(q(p.linkd) + ' send mode desktop');
     await execAndShow(q(p.linkd) + ' restart');
   } else {
-    /* CarWith 投屏：把 CarWith（小米车机互联）本身作为固定目标投到车机上，和紫优模式的接法一致。
+    /* CarWith 投屏：把 CarWith（小米车机互联）本身作为固定目标投到车机上，和 Enthlinn 模式的接法一致。
      * 必须显式给 activity：CarWith 零 LAUNCHER Activity，只传包名时 placement 会报
      * "cannot find a launch entry for com.miui.carlink"，车机屏永远是空的（2026-10-08 现场）。
      * 同时写 app-ui conf，否则重启守护进程后 launcher 从 conf 取不到它。 */
@@ -2127,7 +2127,7 @@ async function setTheme(choice) {
   applyTheme(choice);
   await writeFileText(THEME_FILE, choice);
   if (state.carppModule) {
-    /* The 紫优 virtual screen app reads its own copy, so the two stay in step. */
+    /* The Enthlinn virtual screen app reads its own copy, so the two stay in step. */
     await writeFileText(CARPP_DIR + '/theme', choice);
   }
   say('显示模式：' + ({ auto: '跟随系统', day: '白天', night: '黑夜' }[choice] || choice) + '\n');
