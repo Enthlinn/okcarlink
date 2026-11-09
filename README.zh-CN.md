@@ -11,8 +11,7 @@ OkCarLink 是一个 KernelSU / Magisk 模块，把整套 iPhone 侧协议栈运�
 
 | 模式 | 传输方式 | 本设备扮演的身份 | 状态 |
 | --- | --- | --- | --- |
-| 无线 CarPlay | Wi-Fi | iPhone：发布 iAP2 RFCOMM 服务由主机拨入，再以 AirPlay 把 iAP2 送到主机 | 已支持 |
-| 无线 AirPlay | Wi-Fi | AirPlay 发送端（画面镜像 + 音频），对主机的接收端 | 已支持 |
+| 无线（AirPlay） | Wi-Fi | iPhone 的无线链路：发布 iAP2 RFCOMM 服务由主机拨入，再以 AirPlay 承载画面镜像与音频——车机的「无线 CarPlay」走的就是这套栈，它本身就是 AirPlay，并非另一个模式 | 已支持 |
 | 有线 CarPlay | USB | Apple USB 设备（USBMUX + NCM），自行应答 lockdown | 已支持（需自备 lockdown 身份，见下） |
 
 一切都在模块内完成：一个以 root 运行的无界面守护进程
@@ -21,6 +20,12 @@ OkCarLink 是一个 KernelSU / Magisk 模块，把整套 iPhone 侧协议栈运�
 
 > **现状**：这是可在真车机上使用的移植实现，但并非商业产品，仍可能有粗糙之处；
 > 欢迎提交 issue 与 PR。
+
+## 适配与实测
+
+- **适配真机**：Redmi Note 12 Turbo（Android 15、KernelSU）——本移植的开发与调试机。
+- **真车机实测**：有线 CarPlay 链路（Apple USB 枚举、lockdown、FunctionFS 上的 iAP2）与
+  无线 AirPlay 链路均在真实车机上端到端跑通（画面镜像、音频与触摸回传）。
 
 ## 环境要求
 

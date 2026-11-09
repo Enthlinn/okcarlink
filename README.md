@@ -12,8 +12,7 @@ device sends; touches on the host come back to the device.
 
 | Mode | Transport | What the device plays | Status |
 | --- | --- | --- | --- |
-| Wireless CarPlay | Wi-Fi | the iPhone: an iAP2 RFCOMM service the host dials, then AirPlay carrying iAP2 to the host | supported |
-| Wireless AirPlay | Wi-Fi | an AirPlay sender (screen mirroring + audio) toward the host's receiver | supported |
+| Wireless (AirPlay) | Wi-Fi | the iPhone's wireless link: an iAP2 RFCOMM service the host dials, then AirPlay (screen mirroring + audio). This single stack is what a head unit drives as its "wireless CarPlay" — it is AirPlay, not a separate mode | supported |
 | Wired CarPlay | USB | an Apple USB device (USBMUX + NCM) that answers lockdown itself | supported (needs a lockdown identity, see below) |
 
 Everything runs inside the module: a headless root daemon
@@ -23,13 +22,21 @@ and a WebUI for switching modes and reading logs.
 > **Status:** this is a working port, tested on real head units, but it is not a
 > commercial product. Expect rough edges; issues and PRs are welcome.
 
+## Tested with
+
+- **Adaptation phone:** Redmi Note 12 Turbo (Android 15, KernelSU) — the device this port
+  was developed and debugged on.
+- **Real car head unit:** both the wired CarPlay link (Apple USB enumeration, lockdown,
+  iAP2 over FunctionFS) and the wireless AirPlay link were verified end to end against an
+  actual car head unit — screen mirroring, audio and the touch back-channel.
+
 ## Requirements
 
 - Android 10+ device (the port targets platform behavior up to Android 15-era
   devices; ARM64 for the native binaries), rooted with KernelSU or Magisk
 - A peer host: a car head unit running an iPhone-link app (wireless CarPlay /
   AirPlay), or a second Android device running a head-unit emulator
-- Wi-Fi for the wireless modes; a USB port that can work in device mode for the
+- Wi-Fi for the wireless mode; a USB port that can work in device mode for the
   wired mode — the module re-enumerates the device as an Apple USB device
 - To **build from source**: JDK 17 plus either an AOSP source tree or the published
   dependency bundle; CI does it on every push (see [docs/en/building.md](docs/en/building.md))
