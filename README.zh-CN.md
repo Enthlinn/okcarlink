@@ -25,7 +25,8 @@ OkCarLink 是一个 KernelSU / Magisk 模块，把整套 iPhone 侧协议栈运�
 
 - **适配真机**：Redmi Note 12 Turbo（Android 15、KernelSU）——本移植的开发与调试机。
 - **真车机实测**：有线 CarPlay 链路（Apple USB 枚举、lockdown、FunctionFS 上的 iAP2）与
-  无线 AirPlay 链路均在真实车机上端到端跑通（画面镜像、音频与触摸回传）。
+  无线 AirPlay 链路均在真实车机上端到端跑通（画面镜像、音频与触摸回传），其中测得最多的是
+  车机端的 **DiPlay**。
 
 ## 环境要求
 

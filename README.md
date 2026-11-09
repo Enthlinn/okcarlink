@@ -28,7 +28,8 @@ and a WebUI for switching modes and reading logs.
   was developed and debugged on.
 - **Real car head unit:** both the wired CarPlay link (Apple USB enumeration, lockdown,
   iAP2 over FunctionFS) and the wireless AirPlay link were verified end to end against an
-  actual car head unit — screen mirroring, audio and the touch back-channel.
+  actual car head unit — most of the testing ran against its **DiPlay** app — covering
+  screen mirroring, audio and the touch back-channel.
 
 ## Requirements
 
