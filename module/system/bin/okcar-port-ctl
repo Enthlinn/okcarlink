@@ -800,6 +800,24 @@ wired_boot_autostart() {
     echo "wired 开关已关闭，不自动启动有线"
     return 0
   fi
+  # 已健康就不重拉。2026-11-11 现场：wired-init 观察器在 +45s 前已经把有线拉起来且
+  # 车机连上了，这里再盲跑一轮完整重启（杀守卫、解绑、重绑）就是用户看到的"连上后
+  # 又断开一下"。判据与 okcar-wired-init 一致：state=started 且 gadget 真的绑着 UDC
+  # （state 文件可能跨重启残留，单看它不算健康）。
+  _wb_healthy=no
+  for _wb_g in /config/usb_gadget/g1 /sys/kernel/config/usb_gadget/g1; do
+    if [ "$(cat "$TMP/okcar-carkit.state" 2>/dev/null)" = "started" ] \
+       && [ -n "$(cat "$_wb_g/UDC" 2>/dev/null)" ]; then
+      _wb_healthy=yes
+      break
+    fi
+  done
+  if [ "$_wb_healthy" = "yes" ]; then
+    rm -f "$_pend" "$_fails"
+    log "wired-boot: 有线已健康（state=started，UDC 绑着）——跳过自启，不打扰活动链路"
+    echo "有线已健康，跳过开机自启"
+    return 0
+  fi
   echo "$_boot" > "$_pend"
   log "wired-boot: 开机稳定 ${_delay}s 后自动拉起 Apple gadget"
   echo "开机自启：拉起有线（Apple gadget）…"
