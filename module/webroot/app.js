@@ -866,6 +866,11 @@ const ZH = {
   "Wireless bitrate": "无线码率",
   "Wireless session": "无线会话",
   "Enthlinn carplay++": "Enthlinn 的 carplay++",
+  "Checking for updates…": "正在检查更新…",
+  "New version available:": "发现新版本：",
+  "Already up to date.": "已是最新。",
+  "Update check failed (network?)": "检查更新失败（网络？）",
+  "installed: ": "已安装：",
   "[startup failed]": "[启动失败]",
   "daemon switch on": "守护进程开关打开",
   "(no app list yet)": "（还没有应用清单）",
@@ -2365,6 +2370,52 @@ if (window.matchMedia) {
       items: () => state.activities[state.pickedPkg] || [],
       value: (act) => act.name,
       label: (act) => act.label || '',
+    });
+    /* 检查更新：已装版本走 root exec 读 module.prop；最新版直接在浏览器里 fetch
+     * api.github.com（GitHub API 自带 CORS *，管理器 WebView 有网即可）。逐段数值比较。 */
+    function compareVersions(a, b) {
+      const pa = String(a).split('.'), pb = String(b).split('.');
+      for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+        const x = parseInt(pa[i] || '0', 10) || 0, y = parseInt(pb[i] || '0', 10) || 0;
+        if (x !== y) return x > y ? 1 : -1;
+      }
+      return 0;
+    }
+    async function checkForUpdates() {
+      const note = document.getElementById('update-note');
+      const show = (html) => { if (note) { note.innerHTML = html; note.classList.remove('hidden'); } };
+      show(T('Checking for updates…'));
+      let installed = '';
+      try {
+        const v = await run("sed -n 's/^version=//p' /data/adb/modules/okcarlink/module.prop 2>/dev/null | head -n 1");
+        installed = String((v && v.stdout) || '').trim();
+      } catch (e) { /* 版本读不到就只报 GitHub 侧 */ }
+      let latest = '', url = 'https://github.com/Enthlinn/okcarlink/releases/latest', err = '';
+      try {
+        const res = await fetch('https://api.github.com/repos/Enthlinn/okcarlink/releases/latest',
+          { headers: { Accept: 'application/vnd.github+json' } });
+        if (!res.ok) {
+          err = 'HTTP ' + res.status;
+        } else {
+          const j = await res.json();
+          latest = String(j.tag_name || '').replace(/^v/, '');
+          if (j.html_url) url = j.html_url;
+        }
+      } catch (e) { err = String(e && e.message ? e.message : e); }
+      if (!latest) { show(T('Update check failed (network?)') + (err ? ' — ' + err : '')); return; }
+      const link = '<a href="' + url + '" target="_blank">v' + latest + '</a>';
+      if (installed && compareVersions(latest, installed) > 0) {
+        show(T('New version available:') + ' ' + link + ' — ' + T('installed: ') + 'v' + installed);
+      } else if (!installed) {
+        show(T('New version available:') + ' ' + link);
+      } else {
+        show(T('Already up to date.') + ' (v' + installed + ', GitHub: v' + latest + ')');
+      }
+    }
+    const cub = document.getElementById('btn-check-update');
+    if (cub) cub.addEventListener('click', () => {
+      cub.disabled = true;
+      Promise.resolve(checkForUpdates()).finally(() => { cub.disabled = false; });
     });
     const sb = document.getElementById('btn-select-all');
     if (sb) sb.addEventListener('click', selectOutputText);

@@ -13,6 +13,9 @@
   <div class="titlebar">
     <h1>OkCarLink</h1>
     <span id="variant" class="pill hidden" data-en="Lite" data-zh="精简版">Lite</span>
+    <!-- 检查更新：对比已装版本与 GitHub 最新 release（api.github.com 自带 CORS，浏览器可直接
+         fetch；已装版本走 root exec 读 module.prop）。结果显示在下方 #update-note。 -->
+    <button id="btn-check-update" class="pill" data-en="Check update" data-zh="检查更新">检查更新</button>
     <!-- 语言选择器：标题栏右上角。默认中文；选择记在
          /data/local/tmp/okcar-port-lang，刷新与重启后依然生效。
          语言名各自用自己的文字写（中文/English），不参与翻译。 -->
@@ -38,6 +41,8 @@
   <!-- 两行状态用与下面分类行完全相同的 .cats/.cat 结构：宽度、对齐、开关列都由结构决定，
        不靠任何像素计算。 -->
   <div id="status-cats" class="cats"></div>
+  <!-- 检查更新的结果行：点击标题栏的「检查更新」后填充（含 GitHub release 链接）。 -->
+  <p id="update-note" class="banner hidden"></p>
 </header>
 
 <p id="env" class="banner hidden"></p>
