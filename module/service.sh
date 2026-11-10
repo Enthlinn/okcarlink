@@ -130,3 +130,16 @@ fi
 if [ -x "$CTL" ]; then
   setsid sh -c "'$CTL' wired-boot" >> "$LOG" 2>&1 &
 fi
+
+# ── 系统驱动的有线再断言（与 init rc 触发器同一语义的模块内实现） ───────────────
+# 方向来自 2026-11-10 的现场："让系统主动把 USB 送过来"。init rc 路线（system/etc/init/
+# okcarlink.rc，仓库里已备）被 meta 模块 Magic Mount-rs 挡住——实测它挂 /system/bin/*
+# 与 usr/idc、却跳过 /system/etc/init，extra_mount 只收分区名（2026-11-10）。于是同一
+# 行为改由模块自己的常驻路径实现：观察 sys.usb.config，系统每重建一次 USB，就调用
+# okcar-wired-init 再断言一次 Apple 身份——那个包装自带 开关检查 / 健康检查（已健康
+# 纯 no-op）/ 10 秒防抖，全部 fail-closed；有线活跃时系统不重建 USB，观察器天然安静。
+if [ -x "$MODDIR/system/bin/okcar-wired-init" ]; then
+  WIRED_INIT=$MODDIR/system/bin/okcar-wired-init
+  setsid sh -c 'WIRED_INIT=$1; LAST=""; while :; do C=$(getprop sys.usb.config 2>/dev/null); if [ -n "$C" ] && [ "$C" != "$LAST" ]; then LAST="$C"; "$WIRED_INIT" >/dev/null 2>&1; fi; sleep 3; done' okcar-wired-init-watch "$WIRED_INIT" >> "$LOG" 2>&1 &
+  boot_log "wired-init watcher started (system USB lifecycle -> re-assert)"
+fi
