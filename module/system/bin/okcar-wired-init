@@ -1,0 +1,40 @@
+#!/system/bin/sh
+# OkCarLink —— init 服务入口：系统 USB 生命周期驱动的有线再断言。
+#
+# 设计（2026-11-10，217 现场）：与其在运行期与 init/HAL 赛跑（silence、解绑、重绑，输了
+# 就是"插线后车机不认"），不如让系统自己来触发：init 在每次重建 USB（adbd 起来）与开机
+# 完成时启动本服务，我们在几秒内把 Apple 身份重新绑回去。系统每"送"一次 USB，我们就接一次。
+#
+# 三重护栏（全部 fail-closed，本服务失败不影响既有 service.sh 路径）：
+#   1. wired 开关没开 → 直接退出；
+#   2. 已健康（carkit.state=started 且 g1 绑着 UDC）→ 不折腾；
+#   3. 防抖：10 秒内只触发一次。
+MODDIR=${0%/*}
+[ -x "$MODDIR/okcar-port-ctl" ] || MODDIR=/data/adb/modules/okcarlink/system/bin
+CTL=$MODDIR/okcar-port-ctl
+LOG=/data/local/tmp/okcar-port.log
+SWITCH_FILE=/data/local/tmp/okcar-port-switches.conf
+log() { echo "$(date '+%F %T') wired-init: $*" >> "$LOG"; }
+
+[ -x "$CTL" ] || { log "ctl missing at $CTL — nothing to do"; exit 0; }
+
+# 1. 开关未开：不动作
+grep -qx "wired=on" "$SWITCH_FILE" 2>/dev/null || exit 0
+
+# 2. 已健康：不折腾（state=started 且 gadget 绑着 UDC）
+if [ "$(cat /data/local/tmp/okcar-carkit.state 2>/dev/null)" = "started" ] \
+   && [ -n "$(cat /config/usb_gadget/g1/UDC 2>/dev/null)" ]; then
+  exit 0
+fi
+
+# 3. 防抖：10 秒内只触发一次
+NOW=$(date +%s)
+LAST=$(cat /data/local/tmp/okcar-wired-init.last 2>/dev/null)
+case "$LAST" in ''|*[!0-9]*) LAST=0 ;; esac
+[ $((NOW - LAST)) -lt 10 ] && exit 0
+printf '%s' "$NOW" > /data/local/tmp/okcar-wired-init.last 2>/dev/null
+
+log "init trigger: re-asserting the wired gadget (state=$(cat /data/local/tmp/okcar-carkit.state 2>/dev/null))"
+"$CTL" switch wired on >/dev/null 2>&1 \
+  && log "init trigger: re-assert done" \
+  || log "init trigger: re-assert failed rc=$?"

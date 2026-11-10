@@ -1,0 +1,24 @@
+# OkCarLink —— 让系统自己的 USB 生命周期驱动有线启动（2026-11-10，217 现场设计）。
+#
+# 本文件由模块的 system/ overlay 提供（Magic Mount-rs 挂载后，init 在开机时解析
+# /system/etc/init/*.rc）。它只新增一个 service 与两个触发器，不改写任何系统既有
+# 行为；真正的动作在 okcar-wired-init 里，带开关检查、健康检查与防抖，全部
+# fail-closed —— 服务起不来或脚本失败时，原 service.sh 路径照常工作。
+#
+# 触发语义：
+#   * sys.boot_completed=1        —— 开机完成，接替旧的 +45s 定时自启；
+#   * init.svc.adbd=running 且
+#     sys.usb.configfs=1          —— 系统每重建一次 USB（adb 起来＝系统交还了 configfs），
+#                                     就重新断言一次 Apple 身份。有线活跃时 adbd 走
+#                                     TCP、本触发器不满足，天然不打扰活动会话。
+service okcar-wired-init /system/bin/okcar-wired-init
+    user root
+    seclabel u:r:ksu:s0
+    oneshot
+    disabled
+
+on property:sys.boot_completed=1
+    start okcar-wired-init
+
+on property:init.svc.adbd=running && property:sys.usb.configfs=1
+    start okcar-wired-init
