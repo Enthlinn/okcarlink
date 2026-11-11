@@ -143,9 +143,14 @@ public final class WirelessCarPlaySession implements WirelessCarPlayDriver.Callb
 
     /** The RFCOMM service record the accessory dials (SCN 1 in the captured session). */
     private static final UUID RFCOMM_UUID = UUID.fromString(WirelessMessages.RFCOMM_UUID);
-    private static final String SERVICE_NAME = "OkCarLink Wireless CarPlay";
+    /**
+     * SDP 记录的 ServiceName。车机的判定只读 UUID（docs/OKCAR_BT_CARPLAY_DETECT_STATUS.md
+     * §3.6.1），名字纯属装饰；而全服务响应 1602–1672B 对车机 ~1600B 的发现数据库只有
+     * 2–72B 的余量（§3.5），所以名字压到最短——这几十字节就是"我们的记录进不进缓存"的余量。
+     */
+    private static final String SERVICE_NAME = "O";
     /** Service name of the decorative Apple CarPlay record; a real iPhone's is not known. */
-    private static final String CARPLAY_SERVICE_NAME = "CarPlay";
+    private static final String CARPLAY_SERVICE_NAME = "C";
     /** Upper bound on sockets parked on the CarPlay record so a chatty peer cannot pile up. */
     private static final int MAX_PARKED_CARPLAY_SOCKETS = 4;
     /**
