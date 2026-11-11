@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.okcar.sdpfix"
+    android:versionCode="1"
+    android:versionName="1.0">
+
+    <uses-sdk android:minSdkVersion="29" android:targetSdkVersion="34"/>
+
+    <application
+        android:label="OkCarLink SDP fix"
+        android:allowBackup="false">
+
+        <meta-data android:name="xposedmodule" android:value="true"/>
+        <meta-data
+            android:name="xposeddescription"
+            android:value="OkCarLink: keep the head unit's small SDP cache from dropping OkCarLink's records (trim unused profiles while pairing, restore after the first bond)"/>
+        <meta-data android:name="xposedminversion" android:value="93"/>
+        <meta-data android:name="xposedscope" android:value="com.android.bluetooth"/>
+    </application>
+</manifest>
